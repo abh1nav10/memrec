@@ -68,7 +68,8 @@ impl<S> Registry<S> {
         self.hazptrs.acquire()
     }
 
-    pub fn retire_ptr(&self, ptr: *mut (), deleter: fn(*mut ())) {
+    /// Returns the number of reclaimed pointers from the call to `reclaim memory`.
+    pub fn retire_ptr(&self, ptr: *mut (), deleter: fn(*mut ())) -> usize {
         let retired = Retired {
             next: Cell::new(std::ptr::null_mut()),
             ptr,
@@ -86,7 +87,7 @@ impl<S> Registry<S> {
                 .compare_exchange_weak(head, boxed, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                self.reclaim_memory();
+                break self.reclaim_memory();
             }
         }
     }
@@ -103,8 +104,11 @@ impl<S> Registry<S> {
 
         let mut left_out = std::ptr::null_mut();
         let mut last: Option<*mut Retired> = None;
-        let mut ret_head = self.retired.head.load(Ordering::SeqCst);
         let mut deleted = 0;
+        let mut ret_head = self
+            .retired
+            .head
+            .swap(std::ptr::null_mut(), Ordering::SeqCst);
 
         while !ret_head.is_null() {
             let deref_ret_head = unsafe { &(*ret_head) };
@@ -121,6 +125,7 @@ impl<S> Registry<S> {
                 let owned_ret = unsafe { Box::from_raw(ret_head) };
                 (owned_ret.deleter)(owned_ret.ptr);
                 ret_head = owned_ret.next.get();
+                drop(owned_ret);
             }
         }
 
@@ -322,7 +327,7 @@ pub trait Provide<'registry, S> {
     fn get_deleter(&self) -> fn(*mut ());
     // On swap, the caller may access the pointer given out
     // to access the registry and call the retire method
-    fn retire(self: *mut Self);
+    fn retire(self: *mut Self) -> usize;
 }
 
 pub struct Provider<'registry, T, S> {
@@ -359,7 +364,7 @@ impl<'registry, T, S> Provider<'registry, T, S> {
     }
 
     fn drop(ptr: *mut ()) {
-        let _ = unsafe { Box::from_raw(ptr as *mut T) };
+        let _ = unsafe { Box::from_raw(ptr as *mut Provider<'_, T, S>) };
     }
 }
 
@@ -375,11 +380,11 @@ macro_rules! generate_impl {
             }
 
             #[allow(clippy::not_unsafe_ptr_arg_deref)]
-            fn retire(self: *mut Self) {
+            fn retire(self: *mut Self) -> usize {
                 let shared = unsafe { &(*self) };
                 let registry = shared.access_registry();
                 let deleter = shared.get_deleter();
-                registry.retire_ptr(self as *mut (), deleter);
+                registry.retire_ptr(self as *mut (), deleter)
             }
         }
     };
@@ -401,11 +406,11 @@ impl<T> Provide<'static, Global> for Provider<'static, T, Global> {
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    fn retire(self: *mut Self) {
+    fn retire(self: *mut Self) -> usize {
         let shared = unsafe { &(*self) };
         let registry = shared.access_registry();
         let deleter = shared.get_deleter();
-        registry.retire_ptr(self as *mut (), deleter);
+        registry.retire_ptr(self as *mut (), deleter)
     }
 }
 
@@ -425,4 +430,52 @@ struct Retired {
     next: Cell<*mut Retired>,
     ptr: *mut (),
     deleter: fn(*mut ()),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Count(Arc<AtomicUsize>);
+    impl Drop for Count {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn check_drop() {
+        let registry = Registry::<First>::new();
+        let mut holder = Holder::with_registry(&registry);
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let provider = Box::into_raw(Box::new(Provider::<_, First>::new(
+            Count(Arc::clone(&count)),
+            &registry,
+        )));
+
+        let atomicptr = AtomicPtr::new(provider);
+        let guard = unsafe { holder.load(&atomicptr) }.expect("Cant be null");
+
+        let provider2 = Box::into_raw(Box::new(Provider::<_, First>::new(
+            Count(Arc::clone(&count)),
+            &registry,
+        )));
+
+        let swapped = atomicptr.swap(provider2, Ordering::SeqCst);
+        let num = swapped.retire();
+
+        assert_eq!(num, 0);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+
+        drop(guard);
+
+        let swapped = atomicptr.swap(std::ptr::null_mut(), Ordering::SeqCst);
+        let num = swapped.retire();
+
+        assert_eq!(num, 2);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
 }
