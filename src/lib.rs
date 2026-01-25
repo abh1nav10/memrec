@@ -1,5 +1,5 @@
-//! Using Ordering::SeqCst everywhere for making it easy to proove the correctness
-//! of the algorithm under the Rust memory model gurantees
+// Using Ordering::SeqCst everywhere for making it easy to proove the correctness
+// of the algorithm under the Rust memory model gurantees
 
 #![allow(unused)]
 #![feature(arbitrary_self_types_pointers)]
@@ -8,7 +8,7 @@
 #[non_exhaustive]
 struct Global;
 
-/// These are some types that which I have used to provide an
+/// This module contains some types that which I have used to provide an
 /// implementation of [`Provide`] trait for [`Provider`].
 ///
 /// The user is free to create his own type, and then implement the [`Provide`] trait
@@ -16,18 +16,22 @@ struct Global;
 /// of those many domains while at the same time guaranteeing the safety to some extent
 /// as long as the caller does create many instances of the [`Registry`] for the same
 /// type.
-#[non_exhaustive]
-pub struct First;
-#[non_exhaustive]
-pub struct Second;
-#[non_exhaustive]
-pub struct Third;
-#[non_exhaustive]
-pub struct Fourth;
-#[non_exhaustive]
-pub struct Fifth;
+pub mod markers {
+    #[non_exhaustive]
+    pub struct First;
+    #[non_exhaustive]
+    pub struct Second;
+    #[non_exhaustive]
+    pub struct Third;
+    #[non_exhaustive]
+    pub struct Fourth;
+    #[non_exhaustive]
+    pub struct Fifth;
+}
+use markers::{Fifth, First, Fourth, Second, Third};
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -64,8 +68,82 @@ impl<S> Registry<S> {
         self.hazptrs.acquire()
     }
 
-    fn retire_ptr(&self, ptr: *mut (), deleter: fn(*mut ())) {
-        todo!()
+    pub fn retire_ptr(&self, ptr: *mut (), deleter: fn(*mut ())) {
+        let retired = Retired {
+            next: Cell::new(std::ptr::null_mut()),
+            ptr,
+            deleter,
+        };
+        let boxed = Box::into_raw(Box::new(retired));
+        loop {
+            let mut head = self.retired.head.load(Ordering::SeqCst);
+            unsafe {
+                (*boxed).next.set(head);
+            }
+            if self
+                .retired
+                .head
+                .compare_exchange_weak(head, boxed, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                self.reclaim_memory();
+            }
+        }
+    }
+
+    fn reclaim_memory(&self) -> usize {
+        let mut set = HashSet::new();
+        let mut haz_head = self.hazptrs.head.load(Ordering::SeqCst);
+
+        while !haz_head.is_null() {
+            let deref_head = unsafe { &(*haz_head) };
+            set.insert(deref_head.ptr.load(Ordering::SeqCst));
+            haz_head = deref_head.next.get();
+        }
+
+        let mut left_out = std::ptr::null_mut();
+        let mut last: Option<*mut Retired> = None;
+        let mut ret_head = self.retired.head.load(Ordering::SeqCst);
+        let mut deleted = 0;
+
+        while !ret_head.is_null() {
+            let deref_ret_head = unsafe { &(*ret_head) };
+            if set.contains(&deref_ret_head.ptr) {
+                let temporary = ret_head;
+                ret_head = deref_ret_head.next.get();
+                unsafe { (*temporary).next.set(left_out) };
+                if last.is_none() {
+                    last = Some(temporary);
+                }
+                left_out = temporary;
+            } else {
+                deleted += 1;
+                let owned_ret = unsafe { Box::from_raw(ret_head) };
+                (owned_ret.deleter)(owned_ret.ptr);
+                ret_head = owned_ret.next.get();
+            }
+        }
+
+        if left_out.is_null() {
+            return deleted;
+        }
+
+        assert!(!left_out.is_null());
+        let last_ptr = last.expect("Remaining is not null");
+
+        loop {
+            let mut head = self.retired.head.load(Ordering::SeqCst);
+            unsafe { (*last_ptr).next.set(head) };
+            if self
+                .retired
+                .head
+                .compare_exchange_weak(head, left_out, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        deleted
     }
 }
 
@@ -81,7 +159,39 @@ impl HazardList {
     }
 
     fn acquire(&self) -> &HazPointer {
-        todo!()
+        let mut head = self.head.load(Ordering::SeqCst);
+        while !head.is_null() {
+            let shared = unsafe { &(*head) };
+            if shared.status.load(Ordering::SeqCst)
+                && shared
+                    .status
+                    .compare_exchange_weak(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                return shared;
+            } else {
+                head = shared.next.get();
+            }
+        }
+
+        let hazptr = HazPointer {
+            ptr: AtomicPtr::new(std::ptr::null_mut()),
+            next: Cell::new(std::ptr::null_mut()),
+            status: AtomicBool::new(false),
+        };
+        let boxed = Box::into_raw(Box::new(hazptr));
+        loop {
+            let haz = unsafe { &(*boxed) };
+            let head = self.head.load(Ordering::SeqCst);
+            haz.next.set(head);
+            if self
+                .head
+                .compare_exchange_weak(head, boxed, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break haz;
+            }
+        }
     }
 }
 
@@ -161,7 +271,7 @@ where
     ///   pointer
     ///
     ///   Tieing the mutable borrow to the lifetime of the [`Guard`] ensures that
-    ///   the reference to T will no longer be used after a second use of `load`
+    ///   the reference to `T` will no longer be used after a second use of `load`
     ///   as that would lead to two mutable borrows at the same time, something that
     ///   the borrow checker will reject immediately.
     pub unsafe fn load<T>(&'a mut self, atomic: &AtomicPtr<T>) -> Option<Guard<'a, T>>
