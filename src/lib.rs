@@ -1,5 +1,11 @@
 // Using Ordering::SeqCst everywhere for making it easy to proove the correctness
 // of the algorithm under the Rust memory model gurantees
+//
+// Update 1: 'domain Registry inside of Provider did not allow the creation of Provider
+// in a thread different from where the atomic pointer was created due to lifetime mismatch
+// errors as an AtomicPtr<T> is invariant in T. Therefore I am moving to using Arc<Registry>
+// inside of Provider due get rid of this limitation. Invariance is the limitation and rightly
+// so.
 
 #![allow(unused)]
 #![feature(arbitrary_self_types_pointers)]
@@ -34,6 +40,7 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 static GLOBAL_REGISTRY: Registry<Global> = Registry::new();
@@ -208,6 +215,9 @@ struct HazPointer {
     status: AtomicBool,
 }
 
+unsafe impl Send for HazPointer {}
+unsafe impl Sync for HazPointer {}
+
 impl HazPointer {
     fn protect(&self, ptr: *mut ()) {
         self.ptr.store(ptr, Ordering::SeqCst);
@@ -273,7 +283,8 @@ where
     ///   pointer dereference.
     ///
     ///   The caller must also ensure that the pointer inside of atomic is a valid
-    ///   pointer
+    ///   pointer. Providing a dangling, unaligned or a pointer with different
+    ///   provenance is going to lead to UB on dereference.
     ///
     ///   Tieing the mutable borrow to the lifetime of the [`Guard`] ensures that
     ///   the reference to `T` will no longer be used after a second use of `load`
@@ -281,7 +292,7 @@ where
     ///   the borrow checker will reject immediately.
     pub unsafe fn load<T>(&'a mut self, atomic: &AtomicPtr<T>) -> Option<Guard<'a, T>>
     where
-        T: Provide<'registry, S>,
+        T: Provide<S>,
     {
         let hazpointer = if let Some(haz) = self.hazptr {
             haz
@@ -297,6 +308,7 @@ where
                 if first.is_null() {
                     break None;
                 } else {
+                    // SAFETY: Safe because of the contract on this function.
                     let data = unsafe { &(*first) };
                     break Some(Guard {
                         ptr: data,
@@ -321,8 +333,8 @@ where
 // methods to retire. Since the caller is allowed to create multiple domains
 // providing a trait is the most feasible option
 
-pub trait Provide<'registry, S> {
-    fn access_registry(&self) -> &'registry Registry<S>;
+pub trait Provide<S> {
+    fn access_registry(&self) -> &Arc<Registry<S>>;
 
     fn get_deleter(&self) -> fn(*mut ());
     // On swap, the caller may access the pointer given out
@@ -330,13 +342,13 @@ pub trait Provide<'registry, S> {
     fn retire(self: *mut Self) -> usize;
 }
 
-pub struct Provider<'registry, T, S> {
+pub struct Provider<T, S> {
     inner: T,
-    registry: &'registry Registry<S>,
+    registry: Arc<Registry<S>>,
     deleter: fn(*mut ()),
 }
 
-impl<T, S> Deref for Provider<'_, T, S> {
+impl<T, S> Deref for Provider<T, S> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -344,8 +356,10 @@ impl<T, S> Deref for Provider<'_, T, S> {
     }
 }
 
-impl<T> Provider<'static, T, Global> {
-    pub fn for_global_registry(inner: T, registry: &'static Registry<Global>) -> Self {
+impl<T> Provider<T, Global> {
+    // Getting an Arc<Registry<Global>> is pointless sinceRegistry<Global> is static. This
+    // anyway needs to be done to make it compatible with non-static registries.
+    pub fn for_global_registry(inner: T, registry: Arc<Registry<Global>>) -> Self {
         Self {
             inner,
             registry,
@@ -354,8 +368,8 @@ impl<T> Provider<'static, T, Global> {
     }
 }
 
-impl<'registry, T, S> Provider<'registry, T, S> {
-    pub fn new(inner: T, registry: &'registry Registry<S>) -> Self {
+impl<T, S> Provider<T, S> {
+    pub fn new(inner: T, registry: Arc<Registry<S>>) -> Self {
         Provider {
             inner,
             registry,
@@ -364,15 +378,15 @@ impl<'registry, T, S> Provider<'registry, T, S> {
     }
 
     fn drop(ptr: *mut ()) {
-        let _ = unsafe { Box::from_raw(ptr as *mut Provider<'_, T, S>) };
+        let _ = unsafe { Box::from_raw(ptr as *mut Provider<T, S>) };
     }
 }
 
 macro_rules! generate_impl {
     ($type: ty) => {
-        impl<'registry, T> Provide<'registry, $type> for Provider<'registry, T, $type> {
-            fn access_registry(&self) -> &'registry Registry<$type> {
-                self.registry
+        impl<T> Provide<$type> for Provider<T, $type> {
+            fn access_registry(&self) -> &Arc<Registry<$type>> {
+                &self.registry
             }
 
             fn get_deleter(&self) -> fn(*mut ()) {
@@ -396,9 +410,9 @@ generate_impl!(Third);
 generate_impl!(Fourth);
 generate_impl!(Fifth);
 
-impl<T> Provide<'static, Global> for Provider<'static, T, Global> {
-    fn access_registry(&self) -> &'static Registry<Global> {
-        self.registry
+impl<T> Provide<Global> for Provider<T, Global> {
+    fn access_registry(&self) -> &Arc<Registry<Global>> {
+        &self.registry
     }
 
     fn get_deleter(&self) -> fn(*mut ()) {
@@ -435,7 +449,6 @@ struct Retired {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
     struct Count(Arc<AtomicUsize>);
@@ -447,13 +460,13 @@ mod tests {
 
     #[test]
     fn check_drop() {
-        let registry = Registry::<First>::new();
+        let registry = Arc::new(Registry::<First>::new());
         let mut holder = Holder::with_registry(&registry);
         let count = Arc::new(AtomicUsize::new(0));
 
         let provider = Box::into_raw(Box::new(Provider::<_, First>::new(
             Count(Arc::clone(&count)),
-            &registry,
+            Arc::clone(&registry),
         )));
 
         let atomicptr = AtomicPtr::new(provider);
@@ -461,7 +474,7 @@ mod tests {
 
         let provider2 = Box::into_raw(Box::new(Provider::<_, First>::new(
             Count(Arc::clone(&count)),
-            &registry,
+            Arc::clone(&registry),
         )));
 
         let swapped = atomicptr.swap(provider2, Ordering::SeqCst);
@@ -477,5 +490,64 @@ mod tests {
 
         assert_eq!(num, 2);
         assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn check_concurrency() {
+        struct Inner;
+
+        let registry = Arc::new(Registry::<First>::new());
+
+        let inner = Inner;
+
+        let provider = Box::into_raw(Box::new(Provider::new(inner, Arc::clone(&registry))));
+        let atomic = Arc::new(AtomicPtr::new(provider));
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let handles = (0..100)
+            .map(|i| {
+                let cloned_registry = Arc::clone(&registry);
+                let cloned_atomic = Arc::clone(&atomic);
+                let mut counter = Arc::clone(&counter);
+                if i % 2 == 0 {
+                    std::thread::spawn(move || {
+                        for _ in 0..500 {
+                            let mut holder = Holder::with_registry(&cloned_registry);
+                            let guard = unsafe { holder.load(&cloned_atomic) };
+                            // Reaching here safely should passes the check because the pointers when
+                            // loaded are protected since Holder::load dereferences the pointer after
+                            // loading. That is indeed what we are testing in a concurrent
+                            // scenario.
+                            if let Some(guard) = guard {
+                                counter.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    })
+                } else {
+                    std::thread::spawn(move || {
+                        for _ in 0..500 {
+                            let cloned_for_loop = cloned_registry.clone();
+                            let inner = Inner;
+                            let provider =
+                                Box::into_raw(Box::new(Provider::new(inner, cloned_for_loop)));
+                            let swapped = cloned_atomic.swap(provider, Ordering::SeqCst);
+                            let _ = swapped.retire();
+                        }
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let count = counter.load(Ordering::SeqCst);
+
+        // Trivial check, if we reach here, the test has already passed!!
+        assert!(count > 0);
+
+        println!("{}", count);
     }
 }
