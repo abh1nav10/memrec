@@ -10,6 +10,7 @@
 // Update 2: Updating the loop in Registry::reclaim_memory to make it ABA safe.
 //
 // Update 3: Reclamation now happens in batches(RECLAIM_THRESHOLD);
+//
 
 #![allow(unused)]
 
@@ -48,7 +49,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 const RECLAIM_THRESHOLD: usize = 100;
 
-static GLOBAL_REGISTRY: Registry<Global> = Registry::new();
+pub static GLOBAL_REGISTRY: Registry<Global> = Registry::new();
 
 /// This type is generic over `S` simply for the purpose of providing compile-time checks
 /// to prevent the caller from misusing the API and accidently retiring a pointer a different
@@ -133,6 +134,7 @@ impl<S> Registry<S> {
 
         while !ret_head.is_null() {
             let deref_ret_head = unsafe { &(*ret_head) };
+
             if set.contains(&deref_ret_head.ptr) {
                 let temporary = ret_head;
                 ret_head = deref_ret_head.next.get();
