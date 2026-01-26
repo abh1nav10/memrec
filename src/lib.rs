@@ -6,7 +6,8 @@
 // errors as an AtomicPtr<T> is invariant in T. Therefore I am moving to using Arc<Registry>
 // inside of Provider due get rid of this limitation. Invariance is the limitation and rightly
 // so.
-
+//
+// Update 2: Updating the loop in Registry::reclaim_memory to make it ABA safe.
 #![allow(unused)]
 #![feature(arbitrary_self_types_pointers)]
 
@@ -20,7 +21,7 @@ struct Global;
 /// The user is free to create his own type, and then implement the [`Provide`] trait
 /// for that type with as many types that he wants. That would allow the construction
 /// of those many domains while at the same time guaranteeing the safety to some extent
-/// as long as the caller does create many instances of the [`Registry`] for the same
+/// as long as the caller does NOT create many instances of the [`Registry`] for the same
 /// type.
 pub mod markers {
     #[non_exhaustive]
@@ -45,7 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 static GLOBAL_REGISTRY: Registry<Global> = Registry::new();
 
-/// This type is generic over S simply for the purpose of providing compile-time checks
+/// This type is generic over `S` simply for the purpose of providing compile-time checks
 /// to prevent the caller from misusing the API and accidently retiring a pointer a different
 /// registry from which it was loaded into.
 /// The caller must ensure that no two instances of [`Registry`] are created for the same type.
@@ -75,7 +76,7 @@ impl<S> Registry<S> {
         self.hazptrs.acquire()
     }
 
-    /// Returns the number of reclaimed pointers from the call to `reclaim memory`.
+    /// Returns the number of reclaimed pointers.
     pub fn retire_ptr(&self, ptr: *mut (), deleter: fn(*mut ())) -> usize {
         let retired = Retired {
             next: Cell::new(std::ptr::null_mut()),
@@ -110,7 +111,6 @@ impl<S> Registry<S> {
         }
 
         let mut left_out = std::ptr::null_mut();
-        let mut last: Option<*mut Retired> = None;
         let mut deleted = 0;
         let mut ret_head = self
             .retired
@@ -123,9 +123,6 @@ impl<S> Registry<S> {
                 let temporary = ret_head;
                 ret_head = deref_ret_head.next.get();
                 unsafe { (*temporary).next.set(left_out) };
-                if last.is_none() {
-                    last = Some(temporary);
-                }
                 left_out = temporary;
             } else {
                 deleted += 1;
@@ -140,19 +137,44 @@ impl<S> Registry<S> {
             return deleted;
         }
 
-        assert!(!left_out.is_null());
-        let last_ptr = last.expect("Remaining is not null");
+        let mut list_walk = left_out;
 
+        // This loop is now ABA resistant. Trying to swap the head only with a null pointer as
+        // opposed to relying on the previously loaded head pointer takes away the risk of the ABA
+        // problem. But that has led to walking the list on every swap.
         loop {
-            let mut head = self.retired.head.load(Ordering::SeqCst);
-            unsafe { (*last_ptr).next.set(head) };
             if self
                 .retired
                 .head
-                .compare_exchange_weak(head, left_out, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange_weak(
+                    std::ptr::null_mut(),
+                    list_walk,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
                 .is_ok()
             {
                 break;
+            } else {
+                let swapped = self
+                    .retired
+                    .head
+                    .swap(std::ptr::null_mut(), Ordering::SeqCst);
+                if swapped.is_null() {
+                    continue;
+                }
+                let mut current = swapped;
+                let mut next_ptr_of_current = unsafe { (*current).next.get() };
+                while !next_ptr_of_current.is_null() {
+                    current = next_ptr_of_current;
+                    next_ptr_of_current = unsafe { (*next_ptr_of_current).next.get() };
+                }
+                // Setting the last of current to be list_walk and then try to swap head again with
+                // this.
+                unsafe {
+                    (*current).next.set(list_walk);
+                }
+                list_walk = swapped;
             }
         }
         deleted
@@ -171,6 +193,7 @@ impl HazardList {
     }
 
     fn acquire(&self) -> &HazPointer {
+        // The load can have `Acquire` semantics
         let mut head = self.head.load(Ordering::SeqCst);
         while !head.is_null() {
             let shared = unsafe { &(*head) };
@@ -194,6 +217,7 @@ impl HazardList {
         let boxed = Box::into_raw(Box::new(hazptr));
         loop {
             let haz = unsafe { &(*boxed) };
+            // Relaxed load followed by an Release CAS is fine.
             let head = self.head.load(Ordering::SeqCst);
             haz.next.set(head);
             if self
@@ -276,15 +300,15 @@ where
 {
     /// # SAFETY
     ///    
-    ///   The caller must guarantee that the [`Holder`] being used for this
-    ///   load is the same one that is used for writing to the atomic pointer.
-    ///   This is because reading from one and retiring into another registry
-    ///   immediately raises the possibility of getting into UB due to dangling
-    ///   pointer dereference.
+    ///   1. The caller must guarantee that the [`Holder`] being used for this
+    ///      load is the same one that is used for writing to the atomic pointer.
+    ///      This is because reading from one and retiring into another registry
+    ///      immediately raises the possibility of getting into UB due to dangling
+    ///      pointer dereference.
     ///
-    ///   The caller must also ensure that the pointer inside of atomic is a valid
-    ///   pointer. Providing a dangling, unaligned or a pointer with different
-    ///   provenance is going to lead to UB on dereference.
+    ///   2. The caller must also ensure that the pointer inside of atomic is a valid
+    ///      pointer. Providing a dangling, unaligned or a pointer with different
+    ///      provenance is going to lead to UB on dereference.
     ///
     ///   Tieing the mutable borrow to the lifetime of the [`Guard`] ensures that
     ///   the reference to `T` will no longer be used after a second use of `load`
