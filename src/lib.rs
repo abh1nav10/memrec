@@ -2,5 +2,5 @@
 pub mod hazard;
 pub mod msqueue;
 
-pub use hazard::markers::{Fifth, First, Fourth, Second, Third};
-pub use hazard::{GLOBAL_REGISTRY, Guard, Holder, Provide, Provider, Registry};
+pub use hazard::markers;
+pub use hazard::{GLOBAL_REGISTRY, Holder, Provide, Provider, Registry};

@@ -1,6 +1,7 @@
 #![allow(unused)]
 
-use crate::{First, Guard, Holder, Provider, Registry};
+use crate::markers::First;
+use crate::{Holder, Provide, Provider, Registry};
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::ptr;
@@ -93,7 +94,62 @@ impl<T> Queue<T> {
     }
 
     pub fn dequeue(&self) -> Option<T> {
-        todo!()
+        loop {
+            let mut head_holder = Holder::with_registry(&self.registry);
+            let head_guard =
+                unsafe { head_holder.load(&self.head) }.expect("Sentinel node is always there");
+            let current_head_ptr =
+                head_guard.deref() as *const Provider<_, _> as *mut Provider<_, _>;
+            let mut head_next_holder = Holder::with_registry(&self.registry);
+            let head_next_guard = unsafe { head_next_holder.load(&head_guard.next) };
+
+            if let Some(guard) = head_next_guard {
+                let new_tail_head_ptr =
+                    guard.deref() as *const Provider<_, _> as *mut Provider<_, _>;
+                let mut tail_guard = Holder::with_registry(&self.registry);
+                let tail_guard =
+                    unsafe { tail_guard.load(&self.tail) }.expect("Sentinel node is always there");
+                let current_tail_ptr =
+                    tail_guard.deref() as *const Provider<_, _> as *mut Provider<_, _>;
+
+                // Shared references cannot be compares until the pointee implements PartialEq!
+                if current_head_ptr == current_tail_ptr {
+                    let _ = self.tail.compare_exchange_weak(
+                        current_tail_ptr,
+                        new_tail_head_ptr,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                    continue;
+                } else {
+                    if self
+                        .head
+                        .compare_exchange_weak(
+                            current_head_ptr,
+                            new_tail_head_ptr,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        // Cannot dereference and borrow as mutable since Provider has to implement DerefMut!
+                        // MaybeUninit uses ManuallyDrop, therefore assume_init_read is fine even
+                        // though it creates a bitiwise copy of the value. The caller can drop the
+                        // value but, the danger of double drop is prevented due to MaybeUninit
+                        // using Manuallydrop inside of it.
+                        let read = unsafe { ptr::read(&guard.value) };
+                        let ret = unsafe { read.assume_init_read() };
+                        current_head_ptr.retire();
+                        // forgetting is not required because MaybeUninit implements the Copy trait!
+                        // So its a NOOP
+                        // std::mem::forget(read);
+                        break Some(ret);
+                    }
+                }
+            } else {
+                break None;
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -102,5 +158,49 @@ impl<T> Queue<T> {
         let mut holder = Holder::with_registry(&self.registry);
         let head = unsafe { holder.load(&self.head) }.expect("Sentinel node is always there");
         head.next.load(Ordering::Relaxed).is_null()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_threaded() {
+        let queue = Queue::<u32>::new();
+        assert!(queue.is_empty());
+
+        queue.enqueue(87);
+        assert!(!queue.is_empty());
+
+        let val = queue.dequeue();
+        assert_eq!(val, Some(87));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn multi_threaded() {
+        let queue = Arc::new(Queue::<u32>::new());
+        queue.enqueue(8);
+        let handles = (0..100)
+            .map(|e| {
+                let cloned = Arc::clone(&queue);
+                if e % 2 == 0 {
+                    std::thread::spawn(move || {
+                        cloned.enqueue(e);
+                    })
+                } else {
+                    std::thread::spawn(move || {
+                        let _ = cloned.dequeue();
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert!(!queue.is_empty());
     }
 }

@@ -49,6 +49,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 const RECLAIM_THRESHOLD: usize = 100;
 
+#[allow(private_interfaces)]
 pub static GLOBAL_REGISTRY: Registry<Global> = Registry::new();
 
 /// This type is generic over `S` simply for the purpose of providing compile-time checks
