@@ -12,6 +12,10 @@
 // Update 3: Reclamation now happens in batches(RECLAIM_THRESHOLD);
 //
 // Update 4: Implementaion of DerefMut for Provider.
+//
+// Update 5: Providing a fixed size array when the number of HazPointers are small to avoid
+// allocation of HashSet and provide fast lookups as they can the array can rest on a single
+// cache line. We fallback to HashSet if the number of HazPointers is more than 64;
 
 #![allow(unused)]
 
@@ -44,11 +48,14 @@ use markers::{Fifth, First, Fourth, Second, Third};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 const RECLAIM_THRESHOLD: usize = 100;
+
+const ARRAY_SIZE: usize = 64;
 
 #[allow(private_interfaces)]
 pub static GLOBAL_REGISTRY: Registry<Global> = Registry::new();
@@ -118,38 +125,28 @@ impl<S> Registry<S> {
     }
 
     fn reclaim_memory(&self) -> usize {
-        let mut set = HashSet::new();
-        let mut haz_head = self.hazptrs.head.load(Ordering::SeqCst);
-
-        while !haz_head.is_null() {
-            let deref_head = unsafe { &(*haz_head) };
-            set.insert(deref_head.ptr.load(Ordering::SeqCst));
-            haz_head = deref_head.next.get();
-        }
-
-        let mut left_out = std::ptr::null_mut();
-        let mut deleted = 0;
-        let mut ret_head = self
-            .retired
-            .head
-            .swap(std::ptr::null_mut(), Ordering::SeqCst);
-
-        while !ret_head.is_null() {
-            let deref_ret_head = unsafe { &(*ret_head) };
-
-            if set.contains(&deref_ret_head.ptr) {
-                let temporary = ret_head;
-                ret_head = deref_ret_head.next.get();
-                unsafe { (*temporary).next.set(left_out) };
-                left_out = temporary;
+        let head = self.hazptrs.head.load(Ordering::SeqCst);
+        let data;
+        let mut array = [const { MaybeUninit::uninit() }; 64];
+        if head.is_null() {
+            data = Registry::<S>::rec_array(head, &self.retired.head, 0, array);
+        } else {
+            let deref_head = unsafe { &(*head) };
+            let count = deref_head.count;
+            let ptr = deref_head.ptr.load(Ordering::SeqCst);
+            let next_ptr = deref_head.next.get();
+            if deref_head.count <= ARRAY_SIZE {
+                array[0] = MaybeUninit::new(ptr);
+                data = Registry::<S>::rec_array(next_ptr, &self.retired.head, count - 1, array);
             } else {
-                deleted += 1;
-                let owned_ret = unsafe { Box::from_raw(ret_head) };
-                (owned_ret.deleter)(owned_ret.ptr);
-                ret_head = owned_ret.next.get();
-                drop(owned_ret);
+                let mut set = HashSet::new();
+                set.insert(ptr);
+                data = Registry::<S>::rec_set(next_ptr, &self.retired.head, count - 1, set);
             }
         }
+
+        let left_out = data.0;
+        let deleted = data.1;
 
         if left_out.is_null() {
             return deleted;
@@ -197,6 +194,86 @@ impl<S> Registry<S> {
         }
         deleted
     }
+
+    fn rec_array(
+        ptr: *mut HazPointer,
+        retired: &AtomicPtr<Retired>,
+        size: usize,
+        mut array: [MaybeUninit<*mut ()>; 64],
+    ) -> (*mut Retired, usize) {
+        let mut haz_ptr = ptr;
+        for element in array[1..].iter_mut().take(size) {
+            let deref_haz_ptr = unsafe { &(*haz_ptr) };
+            *element = MaybeUninit::new(deref_haz_ptr.ptr.load(Ordering::SeqCst));
+            haz_ptr = deref_haz_ptr.next.get();
+        }
+
+        let mut left_out = std::ptr::null_mut();
+        let mut deleted = 0;
+        let mut ret_head = retired.swap(std::ptr::null_mut(), Ordering::SeqCst);
+
+        let ptr_to_array = array.as_ptr() as *const *mut ();
+        let array = unsafe { std::slice::from_raw_parts(ptr_to_array, size + 1) };
+
+        while !ret_head.is_null() {
+            let deref_ret_head = unsafe { &(*ret_head) };
+
+            if array
+                .iter()
+                .position(|x| *x == deref_ret_head.ptr)
+                .is_some()
+            {
+                let temporary = ret_head;
+                ret_head = deref_ret_head.next.get();
+                unsafe { (*temporary).next.set(left_out) };
+                left_out = temporary;
+            } else {
+                deleted += 1;
+                let owned_ret = unsafe { Box::from_raw(ret_head) };
+                (owned_ret.deleter)(owned_ret.ptr);
+                ret_head = owned_ret.next.get();
+                drop(owned_ret);
+            }
+        }
+        (left_out, deleted)
+    }
+
+    fn rec_set(
+        ptr: *mut HazPointer,
+        retired: &AtomicPtr<Retired>,
+        size: usize,
+        mut set: HashSet<*mut ()>,
+    ) -> (*mut Retired, usize) {
+        let mut current = ptr;
+        for _ in 0..size {
+            let deref_current = unsafe { &(*current) };
+            let ptr = deref_current.ptr.load(Ordering::SeqCst);
+            set.insert(ptr);
+            current = deref_current.next.get();
+        }
+
+        let mut left_out = std::ptr::null_mut();
+        let mut deleted = 0;
+        let mut ret_head = retired.swap(std::ptr::null_mut(), Ordering::SeqCst);
+
+        while !ret_head.is_null() {
+            let deref_ret_head = unsafe { &(*ret_head) };
+
+            if set.contains(&deref_ret_head.ptr) {
+                let temporary = ret_head;
+                ret_head = deref_ret_head.next.get();
+                unsafe { (*temporary).next.set(left_out) };
+                left_out = temporary;
+            } else {
+                deleted += 1;
+                let owned_ret = unsafe { Box::from_raw(ret_head) };
+                (owned_ret.deleter)(owned_ret.ptr);
+                ret_head = owned_ret.next.get();
+                drop(owned_ret);
+            }
+        }
+        (left_out, deleted)
+    }
 }
 
 struct HazardList {
@@ -231,12 +308,17 @@ impl HazardList {
             ptr: AtomicPtr::new(std::ptr::null_mut()),
             next: Cell::new(std::ptr::null_mut()),
             status: AtomicBool::new(false),
+            count: 0,
         };
         let boxed = Box::into_raw(Box::new(hazptr));
         loop {
-            let haz = unsafe { &(*boxed) };
+            let haz = unsafe { &mut (*boxed) };
             // Relaxed load followed by an Release CAS is fine.
             let head = self.head.load(Ordering::SeqCst);
+            if !head.is_null() {
+                let count = unsafe { (*head).count };
+                haz.count = count + 1;
+            }
             haz.next.set(head);
             if self
                 .head
@@ -255,6 +337,7 @@ struct HazPointer {
     ptr: AtomicPtr<()>,
     next: Cell<*mut HazPointer>,
     status: AtomicBool,
+    count: usize,
 }
 
 unsafe impl Send for HazPointer {}
