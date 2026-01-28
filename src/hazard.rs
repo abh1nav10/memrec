@@ -318,7 +318,7 @@ impl HazardList {
             ptr: AtomicPtr::new(std::ptr::null_mut()),
             next: Cell::new(std::ptr::null_mut()),
             status: AtomicBool::new(false),
-            count: 0,
+            count: 1,
         };
         let boxed = Box::into_raw(Box::new(hazptr));
         loop {
@@ -608,53 +608,50 @@ struct Retired {
 
 #[cfg(test)]
 mod tests {
-
-    // This test used to pass before this update of batched reclaim when the RECLAIM_THRESHOLD is
-    // touched!!
-
     use super::*;
-    //use std::sync::atomic::AtomicUsize;
 
-    //struct Count(Arc<AtomicUsize>);
-    //impl Drop for Count {
-    //    fn drop(&mut self) {
-    //        self.0.fetch_add(1, Ordering::SeqCst);
-    //    }
-    //}
+    struct Count(Arc<AtomicUsize>);
+    impl Drop for Count {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
-    //#[test]
-    //fn check_drop() {
-    //    let registry = Arc::new(Registry::<First>::new());
-    //    let mut holder = Holder::with_registry(&registry);
-    //    let count = Arc::new(AtomicUsize::new(0));
+    #[test]
+    fn check_drop() {
+        let registry = Arc::new(Registry::<First>::new());
+        let mut holder = Holder::with_registry(&registry);
+        let count = Arc::new(AtomicUsize::new(0));
 
-    //    let provider = Box::into_raw(Box::new(Provider::<_, First>::new(
-    //        Count(Arc::clone(&count)),
-    //        Arc::clone(&registry),
-    //    )));
+        let provider = Box::into_raw(Box::new(Provider::<_, First>::new(
+            Count(Arc::clone(&count)),
+            Arc::clone(&registry),
+        )));
 
-    //    let atomicptr = AtomicPtr::new(provider);
-    //    let guard = unsafe { holder.load(&atomicptr) }.expect("Cant be null");
+        let atomicptr = AtomicPtr::new(provider);
+        let guard = unsafe { holder.load(&atomicptr) }.expect("Cant be null");
 
-    //    let provider2 = Box::into_raw(Box::new(Provider::<_, First>::new(
-    //        Count(Arc::clone(&count)),
-    //        Arc::clone(&registry),
-    //    )));
+        let provider2 = Box::into_raw(Box::new(Provider::<_, First>::new(
+            Count(Arc::clone(&count)),
+            Arc::clone(&registry),
+        )));
 
-    //    let swapped = atomicptr.swap(provider2, Ordering::SeqCst);
-    //    let num = swapped.retire();
+        let swapped = atomicptr.swap(provider2, Ordering::SeqCst);
+        let num = swapped.retire();
+        let num = registry.reclaim_memory();
 
-    //    assert_eq!(num, 0);
-    //    assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(num, 0);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
 
-    //    drop(guard);
+        drop(guard);
 
-    //    let swapped = atomicptr.swap(std::ptr::null_mut(), Ordering::SeqCst);
-    //    let num = swapped.retire();
+        let swapped = atomicptr.swap(std::ptr::null_mut(), Ordering::SeqCst);
+        let num = swapped.retire();
+        let num = registry.reclaim_memory();
 
-    //    assert_eq!(num, 2);
-    //    assert_eq!(count.load(Ordering::SeqCst), 2);
-    //}
+        assert_eq!(num, 2);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn check_concurrency() {
