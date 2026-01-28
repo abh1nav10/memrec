@@ -1,9 +1,11 @@
+//! Implementation of Michael-Scott Queue with safe memory reclamation using Hazard Pointers.
+
 #![allow(unused)]
 
 use crate::markers::First;
 use crate::{Holder, Provide, Provider, Registry};
 use std::mem::MaybeUninit;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -32,16 +34,65 @@ impl<T> Node<T> {
     }
 }
 
+#[repr(align(64))]
+struct CacheAligned<T> {
+    atomic: AtomicPtr<Provider<Node<T>, First>>,
+}
+
+impl<T> CacheAligned<T> {
+    const fn new(raw: *mut Provider<Node<T>, First>) -> Self {
+        Self {
+            atomic: AtomicPtr::new(raw),
+        }
+    }
+}
+
+impl<T> Deref for CacheAligned<T> {
+    type Target = AtomicPtr<Provider<Node<T>, First>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.atomic
+    }
+}
+
+impl<T> DerefMut for CacheAligned<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.atomic
+    }
+}
+
 pub struct Queue<T> {
-    head: AtomicPtr<Provider<Node<T>, First>>,
-    tail: AtomicPtr<Provider<Node<T>, First>>,
+    head: CacheAligned<T>,
+    tail: CacheAligned<T>,
     registry: Arc<Registry<First>>,
+}
+
+impl<T> Drop for Queue<T> {
+    fn drop(&mut self) {
+        let mut current = self.head.get_mut();
+        while !current.is_null() {
+            let temporary = unsafe { (&mut **current).next.get_mut() };
+            let _ = unsafe { Box::from_raw(*current) };
+            current = temporary;
+        }
+    }
 }
 
 impl<T> Default for Queue<T> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+pub enum TryEnqResult {
+    Success,
+    Failure,
+}
+
+pub enum TryDeqResult<T> {
+    Success(T),
+    Failure,
+    Empty,
 }
 
 impl<T> Queue<T> {
@@ -51,8 +102,8 @@ impl<T> Queue<T> {
         let sentinel = Provider::new(node, Arc::clone(&registry));
         let raw = Box::into_raw(Box::new(sentinel));
         Self {
-            head: AtomicPtr::new(raw),
-            tail: AtomicPtr::new(raw),
+            head: CacheAligned::new(raw),
+            tail: CacheAligned::new(raw),
             registry,
         }
     }
@@ -70,9 +121,9 @@ impl<T> Queue<T> {
 
             let mut tail_next_holder = Holder::with_registry(&self.registry);
             let next_ptr_of_tail = unsafe { tail_next_holder.load(&guard.next) };
-            let ptr = guard.deref() as *const Provider<_, _> as *mut Provider<_, _>;
+            let ptr = &*guard as *const Provider<_, _> as *mut Provider<_, _>;
             if let Some(g) = next_ptr_of_tail {
-                let next_ptr = g.deref() as *const Provider<_, _> as *mut Provider<_, _>;
+                let next_ptr = &*g as *const Provider<_, _> as *mut Provider<_, _>;
                 let _ = self.tail.compare_exchange_weak(
                     ptr,
                     next_ptr,
@@ -98,19 +149,16 @@ impl<T> Queue<T> {
             let mut head_holder = Holder::with_registry(&self.registry);
             let head_guard =
                 unsafe { head_holder.load(&self.head) }.expect("Sentinel node is always there");
-            let current_head_ptr =
-                head_guard.deref() as *const Provider<_, _> as *mut Provider<_, _>;
+            let current_head_ptr = &*head_guard as *const Provider<_, _> as *mut Provider<_, _>;
             let mut head_next_holder = Holder::with_registry(&self.registry);
             let head_next_guard = unsafe { head_next_holder.load(&head_guard.next) };
 
             if let Some(guard) = head_next_guard {
-                let new_tail_head_ptr =
-                    guard.deref() as *const Provider<_, _> as *mut Provider<_, _>;
+                let new_tail_head_ptr = &*guard as *const Provider<_, _> as *mut Provider<_, _>;
                 let mut tail_guard = Holder::with_registry(&self.registry);
                 let tail_guard =
                     unsafe { tail_guard.load(&self.tail) }.expect("Sentinel node is always there");
-                let current_tail_ptr =
-                    tail_guard.deref() as *const Provider<_, _> as *mut Provider<_, _>;
+                let current_tail_ptr = &*tail_guard as *const Provider<_, _> as *mut Provider<_, _>;
 
                 // Shared references cannot be compares until the pointee implements PartialEq!
                 if current_head_ptr == current_tail_ptr {
@@ -138,16 +186,108 @@ impl<T> Queue<T> {
                         // value but, the danger of double drop is prevented due to MaybeUninit
                         // using Manuallydrop inside of it.
                         let read = unsafe { ptr::read(&guard.value) };
-                        let ret = unsafe { read.assume_init_read() };
+                        // Using assume_init_read() here would have created a bitwise copy of the
+                        // underlying T, but that's not required because we can move the T out as
+                        // we never refer to again, and when the node gets dropped, MaybeUninit
+                        // wont run the destructor of T.
+                        let ret = unsafe { read.assume_init() };
                         current_head_ptr.retire();
-                        // forgetting is not required because MaybeUninit implements the Copy trait!
-                        // So its a NOOP
+                        // Dropping MaybeUninit does not drop the inner T, therefore forgetting
+                        // is a NOOP
                         // std::mem::forget(read);
                         break Some(ret);
                     }
                 }
             } else {
                 break None;
+            }
+        }
+    }
+
+    pub fn try_enqueue(&self, value: T) -> TryEnqResult {
+        let mut node = Node::new();
+        node.write(value);
+        let provider = Provider::new(node, Arc::clone(&self.registry));
+
+        let boxed = Box::into_raw(Box::new(provider));
+        loop {
+            let mut tail_holder = Holder::with_registry(&self.registry);
+            let guard =
+                unsafe { tail_holder.load(&self.tail) }.expect("Sentinel node is always present");
+
+            let mut tail_next_holder = Holder::with_registry(&self.registry);
+            let next_ptr_of_tail = unsafe { tail_next_holder.load(&guard.next) };
+            let ptr = &*guard as *const Provider<_, _> as *mut Provider<_, _>;
+            if let Some(g) = next_ptr_of_tail {
+                let next_ptr = &*g as *const Provider<_, _> as *mut Provider<_, _>;
+                let _ = self.tail.compare_exchange_weak(
+                    ptr,
+                    next_ptr,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                continue;
+            } else if guard
+                .next
+                .compare_exchange_weak(ptr::null_mut(), boxed, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let _ =
+                    self.tail
+                        .compare_exchange_weak(ptr, boxed, Ordering::SeqCst, Ordering::SeqCst);
+                break TryEnqResult::Success;
+            } else {
+                let _ = unsafe { Box::from_raw(boxed) };
+                break TryEnqResult::Failure;
+            }
+        }
+    }
+
+    pub fn try_dequeue(&self) -> TryDeqResult<T> {
+        loop {
+            let mut head_holder = Holder::with_registry(&self.registry);
+            let head_guard =
+                unsafe { head_holder.load(&self.head) }.expect("Sentinel node is always there");
+            let current_head_ptr = &*head_guard as *const Provider<_, _> as *mut Provider<_, _>;
+            let mut head_next_holder = Holder::with_registry(&self.registry);
+            let head_next_guard = unsafe { head_next_holder.load(&head_guard.next) };
+
+            if let Some(guard) = head_next_guard {
+                let new_tail_head_ptr = &*guard as *const Provider<_, _> as *mut Provider<_, _>;
+                let mut tail_guard = Holder::with_registry(&self.registry);
+                let tail_guard =
+                    unsafe { tail_guard.load(&self.tail) }.expect("Sentinel node is always there");
+                let current_tail_ptr = &*tail_guard as *const Provider<_, _> as *mut Provider<_, _>;
+
+                if current_head_ptr == current_tail_ptr {
+                    let _ = self.tail.compare_exchange_weak(
+                        current_tail_ptr,
+                        new_tail_head_ptr,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                    continue;
+                } else {
+                    if self
+                        .head
+                        .compare_exchange_weak(
+                            current_head_ptr,
+                            new_tail_head_ptr,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        let read = unsafe { ptr::read(&guard.value) };
+                        let ret = unsafe { read.assume_init() };
+                        current_head_ptr.retire();
+                        break TryDeqResult::Success(ret);
+                    } else {
+                        break TryDeqResult::Failure;
+                    }
+                }
+            } else {
+                break TryDeqResult::Empty;
             }
         }
     }
