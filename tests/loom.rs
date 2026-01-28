@@ -1,6 +1,3 @@
-// Tested with LOOM_MAX_PREMPTIONS=3(recommended by author of loom), LOOM_MAX_PREMPTIONS=4 and LOOM_MAX_PREMPTIONS=5, passes all
-// of them
-
 #![allow(unexpected_cfgs)]
 
 #[cfg(loom)]
@@ -19,8 +16,8 @@ mod tests {
                 let _ = cloned.dequeue();
             });
             queue.enqueue(88);
-            let deq = queue.dequeue();
             thread.join().unwrap();
+            let deq = queue.dequeue();
             matches!(deq, Some(88) | Some(9));
         });
     }
