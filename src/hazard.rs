@@ -11,6 +11,7 @@
 //
 // Update 3: Reclamation now happens in batches(RECLAIM_THRESHOLD);
 //
+// Update 4: Implementaion of DerefMut for Provider.
 
 #![allow(unused)]
 
@@ -43,7 +44,7 @@ use markers::{Fifth, First, Fourth, Second, Third};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::marker::PhantomData;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
@@ -394,6 +395,17 @@ impl<T, S> Deref for Provider<T, S> {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
+    }
+}
+
+// The implementation of DerefMut will be most useful while dropping data structures implemented on
+// top of this, as instead of atomically loading the ptrs, we can obtain a mutable reference to
+// them since no other thread will be holding it in parallel. Without the implementation of
+// DerefMut, a mutable reference to the fields of Provider cant be obtained through a dereference
+// of a raw pointer to Provider!
+impl<T, S> DerefMut for Provider<T, S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
