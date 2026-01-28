@@ -16,6 +16,9 @@
 // Update 5: Providing a fixed size array when the number of HazPointers are small to avoid
 // allocation of HashSet and provide fast lookups as they can the array can rest on a single
 // cache line. We fallback to HashSet if the number of HazPointers is more than 64;
+//
+// Update 6: Correcting HazPointer reset, guard drop resets hazptr ptr whereas holder drops resets
+// hazptr status. Registry implements Drop.
 
 #![allow(unused)]
 
@@ -71,6 +74,12 @@ pub struct Registry<S> {
     marker: PhantomData<S>,
 }
 
+impl<S> Drop for Registry<S> {
+    fn drop(&mut self) {
+        self.reclaim_memory();
+    }
+}
+
 impl<S> Default for Registry<S> {
     fn default() -> Self {
         Self::new()
@@ -124,7 +133,8 @@ impl<S> Registry<S> {
         }
     }
 
-    fn reclaim_memory(&self) -> usize {
+    /// Returns the number of reclaimed elements!
+    pub fn reclaim_memory(&self) -> usize {
         let head = self.hazptrs.head.load(Ordering::SeqCst);
         let data;
         let mut array = [const { MaybeUninit::uninit() }; 64];
@@ -348,8 +358,11 @@ impl HazPointer {
         self.ptr.store(ptr, Ordering::SeqCst);
     }
 
-    fn reset(&self) {
+    fn reset_ptr(&self) {
         self.ptr.store(std::ptr::null_mut(), Ordering::SeqCst);
+    }
+
+    fn reset_status(&self) {
         self.status.store(true, Ordering::SeqCst);
     }
 }
@@ -367,6 +380,15 @@ impl Holder<'static, Global> {
         }
     }
 }
+
+impl<S> Drop for Holder<'_, S> {
+    fn drop(&mut self) {
+        if let Some(haz) = self.hazptr {
+            haz.reset_status();
+        }
+    }
+}
+
 impl<'registry, S> Holder<'registry, S> {
     pub fn with_registry(registry: &'registry Registry<S>) -> Self {
         Self {
@@ -391,7 +413,7 @@ impl<T> Deref for Guard<'_, T> {
 
 impl<T> Drop for Guard<'_, T> {
     fn drop(&mut self) {
-        self.hazptr.reset();
+        self.hazptr.reset_ptr();
     }
 }
 
@@ -448,7 +470,7 @@ where
 
     pub fn reset(&mut self) {
         if let Some(haz) = self.hazptr {
-            haz.reset();
+            haz.reset_ptr();
         }
     }
 }
