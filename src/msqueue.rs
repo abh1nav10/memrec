@@ -84,7 +84,6 @@ pub struct Queue<T> {
     registry: Arc<Registry<First>>,
 }
 
-#[cfg(not(loom))]
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
         // Identified from loom error for Arc leak. Reclamation only happens in batches, and a
@@ -94,24 +93,19 @@ impl<T> Drop for Queue<T> {
         // all Arc's to Registry are destroyed a call to reclaim memory is going to occur again,
         // but i cannot remove that from Drop impl for Registry. Will be fixed later.
         self.registry.reclaim_memory();
-        let mut current = self.head.get_mut();
-        while !current.is_null() {
-            let temporary = unsafe { (&mut **current).next.get_mut() };
-            let _ = unsafe { Box::from_raw(*current) };
-            current = temporary;
-        }
-    }
-}
-
-#[cfg(loom)]
-impl<T> Drop for Queue<T> {
-    fn drop(&mut self) {
-        self.registry.reclaim_memory();
-        let mut current = self.head.atomic.load(Ordering::SeqCst);
+        // Ordering::SeqCst in order to ensure that nothing is missed as in an Acquire load might
+        // read from any Release store in the total modification order. Also, an Acquire load can
+        // read from a pointer that has been reclaimed if it is there in the load buffer. That
+        // would lead to a dangling pointer dereference.
+        //
+        // It is for this reason that we would have to use SeqCst on CAS operations on head,
+        // otherwise Ordering::AcqRel would have sufficed.
+        let mut current = self.head.load(Ordering::SeqCst);
         while !current.is_null() {
             let temporary = unsafe { Box::from_raw(current) };
-            current = temporary.next.load(Ordering::SeqCst);
-            drop(temporary);
+            // Acquire is fin here because we are no longer in the danger of missing anything or
+            // reading any stale value.
+            current = temporary.next.load(Ordering::Acquire);
         }
     }
 }
@@ -162,21 +156,33 @@ impl<T> Queue<T> {
             let ptr = &*guard as *const Provider<_, _> as *mut Provider<_, _>;
             if let Some(g) = next_ptr_of_tail {
                 let next_ptr = &*g as *const Provider<_, _> as *mut Provider<_, _>;
+                // Tail CAS has to be SeqCst because loading a stale tail in the Holder::load in
+                // hazard pointers might lead to a dangling pointer dereferece!
+                //
+                // The CAS on the next pointer has to be SeqCst as well because in dequeue,
+                // Holder::load returns a None, it might end up concluding that the queue is empty
+                // even when it is not. The possibility of a dangling pointer dereference would
+                // have occured in Holder::load for next pointers as well if a thread is prempted
+                // for too long and wakes up after what the next pointer points to has been
+                // deallocated.
                 let _ = self.tail.compare_exchange_weak(
                     ptr,
                     next_ptr,
                     Ordering::SeqCst,
-                    Ordering::SeqCst,
+                    Ordering::Relaxed,
                 );
                 continue;
             } else if guard
                 .next
-                .compare_exchange_weak(ptr::null_mut(), boxed, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange_weak(ptr::null_mut(), boxed, Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok()
             {
-                let _ =
-                    self.tail
-                        .compare_exchange_weak(ptr, boxed, Ordering::SeqCst, Ordering::SeqCst);
+                let _ = self.tail.compare_exchange_weak(
+                    ptr,
+                    boxed,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                );
                 break;
             }
         }
@@ -204,17 +210,18 @@ impl<T> Queue<T> {
                         current_tail_ptr,
                         new_tail_head_ptr,
                         Ordering::SeqCst,
-                        Ordering::SeqCst,
+                        Ordering::Relaxed,
                     );
                     continue;
                 } else {
+                    // Reason behind SeqCst Ordering is commented in Drop impl.
                     if self
                         .head
                         .compare_exchange_weak(
                             current_head_ptr,
                             new_tail_head_ptr,
                             Ordering::SeqCst,
-                            Ordering::SeqCst,
+                            Ordering::Relaxed,
                         )
                         .is_ok()
                     {
@@ -262,17 +269,20 @@ impl<T> Queue<T> {
                     ptr,
                     next_ptr,
                     Ordering::SeqCst,
-                    Ordering::SeqCst,
+                    Ordering::Relaxed,
                 );
                 continue;
             } else if guard
                 .next
-                .compare_exchange_weak(ptr::null_mut(), boxed, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange_weak(ptr::null_mut(), boxed, Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok()
             {
-                let _ =
-                    self.tail
-                        .compare_exchange_weak(ptr, boxed, Ordering::SeqCst, Ordering::SeqCst);
+                let _ = self.tail.compare_exchange_weak(
+                    ptr,
+                    boxed,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                );
                 break TryEnqResult::Success;
             } else {
                 let _ = unsafe { Box::from_raw(boxed) };
@@ -302,7 +312,7 @@ impl<T> Queue<T> {
                         current_tail_ptr,
                         new_tail_head_ptr,
                         Ordering::SeqCst,
-                        Ordering::SeqCst,
+                        Ordering::Relaxed,
                     );
                     continue;
                 } else {
@@ -312,7 +322,7 @@ impl<T> Queue<T> {
                             current_head_ptr,
                             new_tail_head_ptr,
                             Ordering::SeqCst,
-                            Ordering::SeqCst,
+                            Ordering::Relaxed,
                         )
                         .is_ok()
                     {
