@@ -21,10 +21,16 @@
 // hazptr status. Registry implements Drop.
 
 #![allow(unused)]
+#![allow(unexpected_cfgs)]
 
 // Dont allow the users to construct this type
+#[cfg(not(loom))]
 #[non_exhaustive]
 struct Global;
+
+#[cfg(loom)]
+#[non_exhaustive]
+pub struct Global;
 
 /// This module contains some types that which I have used to provide an
 /// implementation of [`Provide`] trait for [`Provider`].
@@ -48,20 +54,25 @@ pub mod markers {
 }
 use markers::{Fifth, First, Fourth, Second, Third};
 
+use crate::loom::atomic::{Arc, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 const RECLAIM_THRESHOLD: usize = 100;
 
 const ARRAY_SIZE: usize = 64;
 
+#[cfg(not(loom))]
 #[allow(private_interfaces)]
 pub static GLOBAL_REGISTRY: Registry<Global> = Registry::new();
+
+#[cfg(loom)]
+loom::lazy_static! {
+    pub static ref GLOBAL_REGISTRY: Registry<Global> = Registry::new();
+}
 
 /// This type is generic over `S` simply for the purpose of providing compile-time checks
 /// to prevent the caller from misusing the API and accidently retiring a pointer a different
@@ -87,7 +98,16 @@ impl<S> Default for Registry<S> {
 }
 
 impl<S> Registry<S> {
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
+        Self {
+            hazptrs: HazardList::new(),
+            retired: RetiredList::new(),
+            marker: PhantomData,
+        }
+    }
+    #[cfg(loom)]
+    pub fn new() -> Self {
         Self {
             hazptrs: HazardList::new(),
             retired: RetiredList::new(),
@@ -291,7 +311,14 @@ struct HazardList {
 }
 
 impl HazardList {
+    #[cfg(not(loom))]
     const fn new() -> Self {
+        Self {
+            head: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+    #[cfg(loom)]
+    fn new() -> Self {
         Self {
             head: AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -592,7 +619,16 @@ struct RetiredList {
 }
 
 impl RetiredList {
+    #[cfg(not(loom))]
     const fn new() -> Self {
+        Self {
+            head: AtomicPtr::new(std::ptr::null_mut()),
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    #[cfg(loom)]
+    fn new() -> Self {
         Self {
             head: AtomicPtr::new(std::ptr::null_mut()),
             count: AtomicUsize::new(0),

@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[target.'cfg(loom)'.dependencies]
+loom = {version = "0.7", features = ["checkpoint"]}

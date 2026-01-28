@@ -1,14 +1,14 @@
 //! Implementation of Michael-Scott Queue with safe memory reclamation using Hazard Pointers.
 
 #![allow(unused)]
+#![allow(unexpected_cfgs)]
 
+use crate::loom::atomic::{Arc, AtomicPtr, Ordering};
 use crate::markers::First;
 use crate::{Holder, Provide, Provider, Registry};
 use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
 struct Node<T> {
     value: MaybeUninit<T>,
@@ -22,7 +22,16 @@ impl<T> Default for Node<T> {
 }
 
 impl<T> Node<T> {
+    #[cfg(not(loom))]
     const fn new() -> Self {
+        Self {
+            value: MaybeUninit::uninit(),
+            next: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    #[cfg(loom)]
+    fn new() -> Self {
         Self {
             value: MaybeUninit::uninit(),
             next: AtomicPtr::new(ptr::null_mut()),
@@ -40,7 +49,15 @@ struct CacheAligned<T> {
 }
 
 impl<T> CacheAligned<T> {
+    #[cfg(not(loom))]
     const fn new(raw: *mut Provider<Node<T>, First>) -> Self {
+        Self {
+            atomic: AtomicPtr::new(raw),
+        }
+    }
+
+    #[cfg(loom)]
+    fn new(raw: *mut Provider<Node<T>, First>) -> Self {
         Self {
             atomic: AtomicPtr::new(raw),
         }
@@ -67,13 +84,34 @@ pub struct Queue<T> {
     registry: Arc<Registry<First>>,
 }
 
+#[cfg(not(loom))]
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
+        // Identified from loom error for Arc leak. Reclamation only happens in batches, and a
+        // Provider also holds an Arc<Regitry> which means until that memory is deallocated, the
+        // drop impl for Registry wont run. If we dont call reclaim_memory here, we will leak
+        // memory because drop impl for Registry will not run. But the problem here is that once
+        // all Arc's to Registry are destroyed a call to reclaim memory is going to occur again,
+        // but i cannot remove that from Drop impl for Registry. Will be fixed later.
+        self.registry.reclaim_memory();
         let mut current = self.head.get_mut();
         while !current.is_null() {
             let temporary = unsafe { (&mut **current).next.get_mut() };
             let _ = unsafe { Box::from_raw(*current) };
             current = temporary;
+        }
+    }
+}
+
+#[cfg(loom)]
+impl<T> Drop for Queue<T> {
+    fn drop(&mut self) {
+        self.registry.reclaim_memory();
+        let mut current = self.head.atomic.load(Ordering::SeqCst);
+        while !current.is_null() {
+            let temporary = unsafe { Box::from_raw(current) };
+            current = temporary.next.load(Ordering::SeqCst);
+            drop(temporary);
         }
     }
 }
