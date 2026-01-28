@@ -1,6 +1,27 @@
-// Using Ordering::SeqCst everywhere for making it easy to proove the correctness
-// of the algorithm under the Rust memory model gurantees
-//
+//! This module provides a safe Hazard Pointer memory reclamation system.
+//!
+//! All pointers being swapped into the underlying atomic must be created by a `Box`.
+//!
+//! When the underlying atomic is swapped with some other pointer, it must be ensured that the
+//! underlying operation is carried out with `SeqCst` ordering. This is because the library ensures
+//! the their is Sequential Consistency in the operations on the Hazard Pointer as in acquiring,
+//! releasing and loading in the reclamation phase are all sequentially consistent. This coupled with
+//! two loads in [`Holder::load`] ensures that if a Hazard Pointer has been loaded in the reclamation
+//! phase and found to to be null, then the store in [`Holder::load`] happens after it in terms of the
+//! global order which guarantees that the second load will see the updated pointer in the
+//! underlying atomic and the comparison will fail leading us to loop back to restart the process.
+//! Now this guarantee of the second load seeing the updated pointer is present only if the loads
+//! and stores on the underlying atomic are also sequentially consistent because an `Acquire` load is
+//! not guaranteed to see the most recent `Release` store as in there is no global order of events.
+//! The `Acquire` load will establish a happens before relationship with any `Release` store in the
+//! total modification order which is clearly not sufficent because if our load sees the same
+//! pointer that is read on the first try even after the protect happening after the load in the
+//! reclamation phase, our system will still fail. If it is sequentially consistent, and sees the
+//! same pointer that means that it has happened before the swap and since the protect has
+//! happened before the load, it can now be safely claimed that it wont be reclaimed because it is
+//! guaranteed to become visible to the load in reclamation phase. Thus we solve both the problems
+//! with `SeqCst`.
+
 // Update 1: 'domain Registry inside of Provider did not allow the creation of Provider
 // in a thread different from where the atomic pointer was created due to lifetime mismatch
 // errors as an AtomicPtr<T> is invariant in T. Therefore I am moving to using Arc<Registry>
@@ -128,20 +149,23 @@ impl<S> Registry<S> {
         };
         let boxed = Box::into_raw(Box::new(retired));
         loop {
-            let head = self.retired.head.load(Ordering::SeqCst);
+            // Relaxed load is fine due to an AcqRel CAS later to make transitive happens before
+            // relationships being established possible!
+            let head = self.retired.head.load(Ordering::Relaxed);
             unsafe {
                 (*boxed).next.set(head);
             }
             if self
                 .retired
                 .head
-                .compare_exchange_weak(head, boxed, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange_weak(head, boxed, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
+                // Since it is an RMW operation on a counter, Relaxed is fine
                 if let Ok(RECLAIM_THRESHOLD) =
                     self.retired
                         .count
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
                             Some((c + 1) % RECLAIM_THRESHOLD)
                         })
                 {
@@ -155,6 +179,8 @@ impl<S> Registry<S> {
 
     /// Returns the number of reclaimed elements!
     pub fn reclaim_memory(&self) -> usize {
+        // Has to be SeqCst because we cannot afford to miss any HazPointers as that may lead to
+        // freeing up memory which other threads might think is protected
         let head = self.hazptrs.head.load(Ordering::SeqCst);
         let data;
         let mut array = [const { MaybeUninit::uninit() }; 64];
@@ -163,6 +189,7 @@ impl<S> Registry<S> {
         } else {
             let deref_head = unsafe { &(*head) };
             let count = deref_head.count;
+            // Has to be SeqCst for the same reason!
             let ptr = deref_head.ptr.load(Ordering::SeqCst);
             let next_ptr = deref_head.next.get();
             if deref_head.count <= ARRAY_SIZE {
@@ -188,23 +215,28 @@ impl<S> Registry<S> {
         // opposed to relying on the previously loaded head pointer takes away the risk of the ABA
         // problem. But that has led to walking the list on every swap.
         loop {
+            // Since we are swapping with null, we need an Release ordering, as we want other
+            // Release or SeqCst loads that read from this to establish a happens before
+            // relationhip with this
             if self
                 .retired
                 .head
                 .compare_exchange_weak(
                     std::ptr::null_mut(),
                     list_walk,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
+                    Ordering::Release,
+                    Ordering::Relaxed,
                 )
                 .is_ok()
             {
                 break;
             } else {
+                // Ordering has to be Acquire as we must establish a happens before relationship
+                // with prior Release or SeqCst stores as we access the fields!
                 let swapped = self
                     .retired
                     .head
-                    .swap(std::ptr::null_mut(), Ordering::SeqCst);
+                    .swap(std::ptr::null_mut(), Ordering::Acquire);
                 if swapped.is_null() {
                     continue;
                 }
@@ -234,13 +266,17 @@ impl<S> Registry<S> {
         let mut haz_ptr = ptr;
         for element in array[1..].iter_mut().take(size) {
             let deref_haz_ptr = unsafe { &(*haz_ptr) };
+            // Ordering::SeqCst as we cannot afford to not see any held Hazard Pointers due to the
+            // danger of freeing memory that other threads think is protected!
             *element = MaybeUninit::new(deref_haz_ptr.ptr.load(Ordering::SeqCst));
             haz_ptr = deref_haz_ptr.next.get();
         }
 
         let mut left_out = std::ptr::null_mut();
         let mut deleted = 0;
-        let mut ret_head = retired.swap(std::ptr::null_mut(), Ordering::SeqCst);
+        // As we access the fields of Retired node, we must see the prior allocation, hence
+        // Ordering::Acquire
+        let mut ret_head = retired.swap(std::ptr::null_mut(), Ordering::Acquire);
 
         let ptr_to_array = array.as_ptr() as *const *mut ();
         let array = unsafe { std::slice::from_raw_parts(ptr_to_array, size + 1) };
@@ -284,7 +320,7 @@ impl<S> Registry<S> {
 
         let mut left_out = std::ptr::null_mut();
         let mut deleted = 0;
-        let mut ret_head = retired.swap(std::ptr::null_mut(), Ordering::SeqCst);
+        let mut ret_head = retired.swap(std::ptr::null_mut(), Ordering::Acquire);
 
         while !ret_head.is_null() {
             let deref_ret_head = unsafe { &(*ret_head) };
@@ -325,14 +361,18 @@ impl HazardList {
     }
 
     fn acquire(&self) -> &HazPointer {
-        // The load can have `Acquire` semantics
-        let mut head = self.head.load(Ordering::SeqCst);
+        // Acquire because we must see the allocation we are accessing, we establish a happens
+        // before relationship with prior Release or SeqCst store that we read
+        let mut head = self.head.load(Ordering::Acquire);
         while !head.is_null() {
             let shared = unsafe { &(*head) };
+            // Ordering::Relaxed because storing true cannot conflict sequentially with this
+            // operation as the CAS is from true -> false, which will succeed only if the value is
+            // true in the first place!
             if shared.status.load(Ordering::SeqCst)
                 && shared
                     .status
-                    .compare_exchange_weak(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .compare_exchange_weak(true, false, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
             {
                 return shared;
@@ -350,8 +390,8 @@ impl HazardList {
         let boxed = Box::into_raw(Box::new(hazptr));
         loop {
             let haz = unsafe { &mut (*boxed) };
-            // Relaxed load followed by an Release CAS is fine.
-            let head = self.head.load(Ordering::SeqCst);
+            // Acquire load because we access the fields
+            let head = self.head.load(Ordering::Acquire);
             if !head.is_null() {
                 let count = unsafe { (*head).count };
                 haz.count = count + 1;
@@ -359,7 +399,7 @@ impl HazardList {
             haz.next.set(head);
             if self
                 .head
-                .compare_exchange_weak(head, boxed, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange_weak(head, boxed, Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok()
             {
                 break haz;
@@ -382,15 +422,21 @@ unsafe impl Sync for HazPointer {}
 
 impl HazPointer {
     fn protect(&self, ptr: *mut ()) {
+        // Ordering::SeqCst because we cannot afford for this store to be missed!
+        // Since there is a global order of events, if any load in the reclamation process misses
+        // it and reclaims memory, that means that the next load in the load function is going to
+        // see the updated pointer which guarantees that memory will be safely handled and no
+        // dangling pointer dereferences will occur
         self.ptr.store(ptr, Ordering::SeqCst);
     }
 
     fn reset_ptr(&self) {
+        // Has to be Ordering::SeqCst for the same reason as in case of protect!
         self.ptr.store(std::ptr::null_mut(), Ordering::SeqCst);
     }
 
     fn reset_status(&self) {
-        self.status.store(true, Ordering::SeqCst);
+        self.status.store(true, Ordering::Relaxed);
     }
 }
 
@@ -473,7 +519,7 @@ where
         } else {
             self.registry.acquire_hazptr()
         };
-
+        // Reason for Ordering::SeqCst has been documented at the mod level!
         let mut first = atomic.load(Ordering::SeqCst);
         hazpointer.protect(first as *mut ());
         loop {
@@ -530,11 +576,6 @@ impl<T, S> Deref for Provider<T, S> {
     }
 }
 
-// The implementation of DerefMut will be most useful while dropping data structures implemented on
-// top of this, as instead of atomically loading the ptrs, we can obtain a mutable reference to
-// them since no other thread will be holding it in parallel. Without the implementation of
-// DerefMut, a mutable reference to the fields of Provider cant be obtained through a dereference
-// of a raw pointer to Provider!
 impl<T, S> DerefMut for Provider<T, S> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
