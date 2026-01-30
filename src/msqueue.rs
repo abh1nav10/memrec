@@ -3,6 +3,7 @@
 #![allow(unused)]
 #![allow(unexpected_cfgs)]
 
+use crate::Backoff;
 use crate::loom::atomic::{Arc, AtomicPtr, Ordering};
 use crate::markers::First;
 use crate::{Holder, Provide, Provider, Registry};
@@ -116,17 +117,6 @@ impl<T> Default for Queue<T> {
     }
 }
 
-pub enum TryEnqResult {
-    Success,
-    Failure,
-}
-
-pub enum TryDeqResult<T> {
-    Success(T),
-    Failure,
-    Empty,
-}
-
 impl<T> Queue<T> {
     pub fn new() -> Self {
         let registry = Arc::new(Registry::<First>::new());
@@ -141,6 +131,8 @@ impl<T> Queue<T> {
     }
 
     pub fn enqueue(&self, value: T) {
+        let backoff = crate::backoff::Backoff::new();
+
         let mut node = Node::new();
         node.write(value);
         let provider = Provider::new(node, Arc::clone(&self.registry));
@@ -184,11 +176,14 @@ impl<T> Queue<T> {
                     Ordering::Relaxed,
                 );
                 break;
+            } else {
+                backoff.initiate();
             }
         }
     }
 
     pub fn dequeue(&self) -> Option<T> {
+        let backoff = crate::backoff::Backoff::new();
         loop {
             let mut head_holder = Holder::with_registry(&self.registry);
             let head_guard =
@@ -241,6 +236,8 @@ impl<T> Queue<T> {
                         // is a NOOP
                         // std::mem::forget(read);
                         break Some(ret);
+                    } else {
+                        backoff.initiate();
                     }
                 }
             } else {
@@ -249,7 +246,8 @@ impl<T> Queue<T> {
         }
     }
 
-    pub fn try_enqueue(&self, value: T) -> TryEnqResult {
+    pub fn enqueue_with_backoff(&self, value: T) {
+        let backoff = Backoff::new();
         let mut node = Node::new();
         node.write(value);
         let provider = Provider::new(node, Arc::clone(&self.registry));
@@ -283,15 +281,15 @@ impl<T> Queue<T> {
                     Ordering::SeqCst,
                     Ordering::Relaxed,
                 );
-                break TryEnqResult::Success;
+                break;
             } else {
-                let _ = unsafe { Box::from_raw(boxed) };
-                break TryEnqResult::Failure;
+                backoff.initiate();
             }
         }
     }
 
-    pub fn try_dequeue(&self) -> TryDeqResult<T> {
+    pub fn dequeue_with_backoff(&self) -> Option<T> {
+        let backoff = Backoff::new();
         loop {
             let mut head_holder = Holder::with_registry(&self.registry);
             let head_guard =
@@ -329,13 +327,13 @@ impl<T> Queue<T> {
                         let read = unsafe { ptr::read(&guard.value) };
                         let ret = unsafe { read.assume_init() };
                         current_head_ptr.retire();
-                        break TryDeqResult::Success(ret);
+                        break Some(ret);
                     } else {
-                        break TryDeqResult::Failure;
+                        backoff.initiate();
                     }
                 }
             } else {
-                break TryDeqResult::Empty;
+                break None;
             }
         }
     }
@@ -380,6 +378,32 @@ mod tests {
                 } else {
                     std::thread::spawn(move || {
                         let _ = cloned.dequeue();
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert!(!queue.is_empty());
+    }
+
+    #[test]
+    fn multi_threaded_with_backoff() {
+        let queue = Arc::new(Queue::<u32>::new());
+        queue.enqueue_with_backoff(8);
+        let handles = (0..100)
+            .map(|e| {
+                let cloned = Arc::clone(&queue);
+                if e % 2 == 0 {
+                    std::thread::spawn(move || {
+                        cloned.enqueue_with_backoff(e);
+                    })
+                } else {
+                    std::thread::spawn(move || {
+                        let _ = cloned.dequeue_with_backoff();
                     })
                 }
             })
