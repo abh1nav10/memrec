@@ -2,8 +2,17 @@
 name = "recmem"
 version = "0.1.0"
 edition = "2024"
+authors = ["abh1nav10"]
 
 [dependencies]
 
 [target.'cfg(loom)'.dependencies]
 loom = {version = "0.7", features = ["checkpoint"]}
+
+[dev-dependencies]
+criterion = "0.8"
+crossbeam = "0.8"
+
+[[bench]]
+name = "comparison"
+harness = false
