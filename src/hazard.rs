@@ -177,6 +177,34 @@ impl<S> Registry<S> {
         }
     }
 
+    /// Retire the pointer without updating the retired count. This method can be used if the
+    /// caller wants to manually reclaim memory as per his requirements by calling
+    /// [`Registry::reclaim_memory`].
+    pub fn retire_without_update(&self, ptr: *mut (), deleter: fn(*mut ())) {
+        let retired = Retired {
+            next: Cell::new(std::ptr::null_mut()),
+            ptr,
+            deleter,
+        };
+        let boxed = Box::into_raw(Box::new(retired));
+        loop {
+            // Relaxed load is fine due to an AcqRel CAS later to make transitive happens before
+            // relationships being established possible!
+            let head = self.retired.head.load(Ordering::Relaxed);
+            unsafe {
+                (*boxed).next.set(head);
+            }
+            if self
+                .retired
+                .head
+                .compare_exchange_weak(head, boxed, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
     /// Returns the number of reclaimed elements!
     pub fn reclaim_memory(&self) -> usize {
         // Has to be SeqCst because we cannot afford to miss any HazPointers as that may lead to
@@ -557,9 +585,13 @@ pub trait Provide<S> {
     fn access_registry(&self) -> &Arc<Registry<S>>;
 
     fn get_deleter(&self) -> fn(*mut ());
+
     // On swap, the caller may access the pointer given out
     // to access the registry and call the retire method
+    // TODO: Mark these unsafe
     fn retire(self: *mut Self) -> usize;
+
+    fn retire_without_reclaim(self: *mut Self);
 }
 
 pub struct Provider<T, S> {
@@ -626,6 +658,14 @@ macro_rules! generate_impl {
                 let deleter = shared.get_deleter();
                 registry.retire_ptr(self as *mut (), deleter)
             }
+
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
+            fn retire_without_reclaim(self: *mut Self) {
+                let shared = unsafe { &(*self) };
+                let registry = shared.access_registry();
+                let deleter = shared.get_deleter();
+                registry.retire_without_update(self as *mut (), deleter);
+            }
         }
     };
 }
@@ -651,6 +691,14 @@ impl<T> Provide<Global> for Provider<T, Global> {
         let registry = shared.access_registry();
         let deleter = shared.get_deleter();
         registry.retire_ptr(self as *mut (), deleter)
+    }
+
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn retire_without_reclaim(self: *mut Self) {
+        let shared = unsafe { &(*self) };
+        let registry = shared.access_registry();
+        let deleter = shared.get_deleter();
+        registry.retire_without_update(self as *mut (), deleter);
     }
 }
 

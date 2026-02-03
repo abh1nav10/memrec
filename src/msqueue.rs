@@ -338,6 +338,62 @@ impl<T> Queue<T> {
         }
     }
 
+    pub fn dequeue_without_reclaim_with_backoff(&self) -> Option<T> {
+        let backoff = Backoff::new();
+        loop {
+            let mut head_holder = Holder::with_registry(&self.registry);
+            let head_guard =
+                unsafe { head_holder.load(&self.head) }.expect("Sentinel node is always there");
+            let current_head_ptr = &*head_guard as *const Provider<_, _> as *mut Provider<_, _>;
+            let mut head_next_holder = Holder::with_registry(&self.registry);
+            let head_next_guard = unsafe { head_next_holder.load(&head_guard.next) };
+
+            if let Some(guard) = head_next_guard {
+                let new_tail_head_ptr = &*guard as *const Provider<_, _> as *mut Provider<_, _>;
+                let mut tail_guard = Holder::with_registry(&self.registry);
+                let tail_guard =
+                    unsafe { tail_guard.load(&self.tail) }.expect("Sentinel node is always there");
+                let current_tail_ptr = &*tail_guard as *const Provider<_, _> as *mut Provider<_, _>;
+
+                if current_head_ptr == current_tail_ptr {
+                    let _ = self.tail.compare_exchange_weak(
+                        current_tail_ptr,
+                        new_tail_head_ptr,
+                        Ordering::SeqCst,
+                        Ordering::Relaxed,
+                    );
+                    continue;
+                } else {
+                    if self
+                        .head
+                        .compare_exchange_weak(
+                            current_head_ptr,
+                            new_tail_head_ptr,
+                            Ordering::SeqCst,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        let read = unsafe { ptr::read(&guard.value) };
+                        let ret = unsafe { read.assume_init() };
+                        current_head_ptr.retire_without_reclaim();
+                        break Some(ret);
+                    } else {
+                        backoff.initiate();
+                    }
+                }
+            } else {
+                break None;
+            }
+        }
+    }
+
+    /// Callers can use this method to get a handle to the registry which can then be used to
+    /// reclaim memory if the [`Queue::dequeue_without_reclaim_with_backoff`] method has been used.
+    pub fn get_registry_handle(&self) -> Arc<Registry<First>> {
+        Arc::clone(&self.registry)
+    }
+
     pub fn is_empty(&self) -> bool {
         // We load it into a hazard pointer because dereferencing it just like that might race with
         // another allocation happening at the same memory slot.
