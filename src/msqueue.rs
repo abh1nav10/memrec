@@ -1,6 +1,5 @@
 //! Implementation of Michael-Scott Queue with safe memory reclamation using Hazard Pointers.
 
-#![allow(unused)]
 #![allow(unexpected_cfgs)]
 
 use crate::Backoff;

@@ -41,7 +41,6 @@
 // Update 6: Correcting HazPointer reset, guard drop resets hazptr ptr whereas holder drops resets
 // hazptr status. Registry implements Drop.
 
-#![allow(unused)]
 #![allow(unexpected_cfgs)]
 
 // Dont allow the users to construct this type
@@ -381,6 +380,7 @@ impl HazardList {
             head: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
+
     #[cfg(loom)]
     fn new() -> Self {
         Self {
@@ -588,7 +588,7 @@ pub trait Provide<S> {
 
     // On swap, the caller may access the pointer given out
     // to access the registry and call the retire method
-    // TODO: Mark these unsafe
+    // TODO: Mark these unsafe or find a better way to not expose unsafe to callers!
     fn retire(self: *mut Self) -> usize;
 
     fn retire_without_reclaim(self: *mut Self);
@@ -762,7 +762,7 @@ mod tests {
         )));
 
         let swapped = atomicptr.swap(provider2, Ordering::SeqCst);
-        let num = swapped.retire();
+        let _ = swapped.retire();
         let num = registry.reclaim_memory();
 
         assert_eq!(num, 0);
@@ -771,7 +771,7 @@ mod tests {
         drop(guard);
 
         let swapped = atomicptr.swap(std::ptr::null_mut(), Ordering::SeqCst);
-        let num = swapped.retire();
+        let _ = swapped.retire();
         let num = registry.reclaim_memory();
 
         assert_eq!(num, 2);

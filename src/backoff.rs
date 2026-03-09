@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use std::cell::Cell;
 
 const SPIN_LIMIT: u8 = 7;

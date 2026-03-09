@@ -1,14 +1,13 @@
-#![allow(unused)]
-
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use crossbeam::queue::SegQueue;
 use recmem::Queue;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 struct Pool<const N: usize> {
+    #[allow(dead_code)]
     joinhandles: [JoinHandle<()>; N],
     status: [Arc<AtomicBool>; N],
     flag: Arc<AtomicBool>,
@@ -200,7 +199,7 @@ fn bench_locking(c: &mut Criterion) {
                 let queue = Arc::new(Mutex::new(Vec::new()));
                 Pool::locking(queue)
             },
-            |mut pool| measure(black_box(pool)),
+            |pool| measure(black_box(pool)),
             BatchSize::PerIteration,
         )
     });
@@ -215,7 +214,7 @@ fn bench_lockfree_queue(c: &mut Criterion) {
                 let queue = Arc::new(Queue::new());
                 Pool::lock_free_backoff(queue)
             },
-            |mut pool| measure(black_box(pool)),
+            |pool| measure(black_box(pool)),
             BatchSize::PerIteration,
         )
     });
@@ -230,7 +229,7 @@ fn bench_crossbeam_segqueue(c: &mut Criterion) {
                 let queue = Arc::new(SegQueue::new());
                 Pool::crossbeam_segqueue(queue)
             },
-            |mut pool| measure(black_box(pool)),
+            |pool| measure(black_box(pool)),
             BatchSize::PerIteration,
         )
     });
