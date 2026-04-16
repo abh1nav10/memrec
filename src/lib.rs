@@ -1,5 +1,6 @@
 #![feature(arbitrary_self_types_pointers)]
 pub mod backoff;
+pub mod fastsync;
 pub mod hazard;
 mod loom;
 pub mod msqueue;

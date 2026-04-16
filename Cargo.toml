@@ -6,6 +6,7 @@ authors = ["abh1nav10"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+crossbeam-utils = "0.8.21"
 
 [target.'cfg(loom)'.dependencies]
 loom = {version = "0.7", features = ["checkpoint"]}
