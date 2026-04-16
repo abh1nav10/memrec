@@ -6,6 +6,8 @@ authors = ["abh1nav10"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# Currently being used only for fastsync. The lockfree queue MS QUEUE and hazard pointer 
+# implementation use only the standard library.
 crossbeam-utils = "0.8.21"
 
 [target.'cfg(loom)'.dependencies]
@@ -14,7 +16,12 @@ loom = {version = "0.7", features = ["checkpoint"]}
 [dev-dependencies]
 criterion = "0.8"
 crossbeam = "0.8"
+flume = "0.12"
 
 [[bench]]
 name = "comparison"
+harness = false
+
+[[bench]]
+name = "fast"
 harness = false
