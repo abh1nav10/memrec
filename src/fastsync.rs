@@ -225,4 +225,86 @@ mod tests {
             handle.join().unwrap();
         }
     }
+
+    use std::sync::Barrier;
+    use std::time::Instant;
+    #[test]
+    fn measure_fastsync() {
+        let fastsync = Arc::new(FastSync::<32, 2, _>::new());
+        let barrier = Arc::new(Barrier::new(6));
+
+        let handles = (0..5)
+            .map(|_| {
+                let cloned = Arc::clone(&fastsync);
+                let barrier = Arc::clone(&barrier);
+
+                std::thread::spawn(move || {
+                    barrier.wait();
+
+                    for i in 0..4 {
+                        let _ = cloned.push(i);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let time = Instant::now();
+
+        barrier.wait();
+
+        let mut count = 0;
+        for _ in 0..8 {
+            fastsync.drain_with(|_| count += 1);
+        }
+
+        let elapsed = time.elapsed().as_micros();
+
+        println!("{elapsed}");
+
+        println!("{count}");
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn measure_arrayqueue() {
+        let queue = Arc::new(crossbeam::queue::ArrayQueue::new(64));
+        let barrier = Arc::new(Barrier::new(6));
+
+        let handles = (0..5)
+            .map(|_| {
+                let cloned = Arc::clone(&queue);
+                let barrier = Arc::clone(&barrier);
+
+                std::thread::spawn(move || {
+                    barrier.wait();
+
+                    for i in 0..4 {
+                        let _ = cloned.push(i);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let time = Instant::now();
+
+        barrier.wait();
+
+        let mut count = 0;
+        for _ in 0..8 {
+            while queue.pop().is_some() {
+                count += 1;
+            }
+        }
+
+        let elapsed = time.elapsed().as_micros();
+
+        println!("{elapsed}");
+
+        println!("{count}");
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
 }
