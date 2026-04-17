@@ -116,6 +116,10 @@ struct Slot<const SIZE: usize, T> {
     /// The current offset into the allocation.
     offset: CachePadded<AtomicUsize>,
 
+    /// The threads update this flag with an AcqRel ordering in order to ensure that we establish a
+    /// transitive happens before relationship with all prior writes.
+    counter: CachePadded<AtomicUsize>,
+
     /// Flag to signal that the batch is ready to be recieved. We use this flag in order to avoid
     /// any form of contention on the offset by the executor if the corresponding flag is not ready
     /// to be received.
@@ -133,7 +137,7 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
         assert!(size_of::<T>() > 0, "Zero sized types are not supported!");
         assert!(SIZE < isize::MAX as usize);
 
-        let layout = Layout::array::<CachePadded<T>>(SIZE).expect("Size if less than `isize::MAX`");
+        let layout = Layout::array::<T>(SIZE).expect("Size if less than `isize::MAX`");
         let ptr = unsafe { alloc::alloc(layout) };
 
         let ptr = match NonNull::new(ptr as *mut T) {
@@ -144,20 +148,22 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
         Self {
             ptr,
             offset: CachePadded::new(AtomicUsize::new(0)),
+            counter: CachePadded::new(AtomicUsize::new(0)),
             flag: CachePadded::new(AtomicBool::new(false)),
         }
     }
 
     fn push(&self, value: T) -> OpResult<T> {
         let mut current = self.offset.load(Ordering::Relaxed);
-        if current >= SIZE {
+        // The offset can never go beyond SIZE.
+        if current == SIZE {
             return OpResult::BackPressure(value);
         }
         loop {
             match self.offset.compare_exchange_weak(
                 current,
                 current + 1,
-                Ordering::AcqRel,
+                Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
@@ -167,9 +173,18 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
                         let offset = ptr.add(current);
                         ptr::write(offset, value);
                     };
+
+                    // This increment is necessary because this is what helps establish a happens
+                    // before relationship with the writes by other threads.
+                    self.counter.fetch_add(1, Ordering::AcqRel);
+
                     if current == (SIZE - 1) {
-                        // We store `SIZE + 1` in order to ensure that when the executor loads, its
-                        // gets to see our final write as well.
+                        // We store with a Release flag because that ensures that when the executor
+                        // loads and sees ready, it applies an Acquire fence which establishes a
+                        // happens before relationship with this Release store and since the
+                        // fetch_add previously cannot be reordered to happen after this store
+                        // because of the Release Ordering, the executor are guaranteed to see all prior
+                        // writes.
                         self.flag.store(true, Ordering::Release);
                     }
                     break OpResult::Success;
@@ -269,7 +284,7 @@ mod tests {
 
     #[test]
     fn measure_arrayqueue() {
-        let queue = Arc::new(crossbeam::queue::ArrayQueue::new(64));
+        let queue = Arc::new(crossbeam_queue::ArrayQueue::new(64));
         let barrier = Arc::new(Barrier::new(6));
 
         let handles = (0..5)
