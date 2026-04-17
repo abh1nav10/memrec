@@ -107,7 +107,7 @@ where
         OpResult::BackPressure(value)
     }
 
-    pub fn drain_with(&self, mut f: impl FnMut(T)) {
+    pub fn drain_with(&self, mut f: impl FnMut(CachePadded<T>)) {
         // We have to pop the elements, and also reset the offset of the batches that we drain, back
         // to zero.
         let ptrs = self.slot_ptrs.as_ptr();
@@ -162,11 +162,7 @@ where
 /// `SIZE` referes to the size of the allocation.
 struct Slot<const SIZE: usize, T> {
     /// Pointer to the start of the allocation.
-    /// We do not use CachePadded for T because this data structure is being designed to be used in
-    /// a way where there are multiple batches to spread contention but the size of the batch is not
-    /// so high and therefore cachepadding will only come at the cost of delayed memory accesses and
-    /// nothing else.
-    ptr: NonNull<T>,
+    ptr: NonNull<CachePadded<T>>,
 
     /// The current offset into the allocation.
     offset: CachePadded<AtomicUsize>,
@@ -178,7 +174,7 @@ struct Slot<const SIZE: usize, T> {
     /// Flag to signal that the batch is ready to be recieved. We use this flag in order to avoid
     /// any form of contention on the offset by the executor if the corresponding flag is not ready
     /// to be received.
-    flag: CachePadded<AtomicBool>,
+    flag: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -192,10 +188,10 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
         assert!(size_of::<T>() > 0, "Zero sized types are not supported!");
         assert!(SIZE < isize::MAX as usize);
 
-        let layout = Layout::array::<T>(SIZE).expect("Size if less than `isize::MAX`");
+        let layout = Layout::array::<CachePadded<T>>(SIZE).expect("Size if less than `isize::MAX`");
         let ptr = unsafe { alloc::alloc(layout) };
 
-        let ptr = match NonNull::new(ptr as *mut T) {
+        let ptr = match NonNull::new(ptr as *mut CachePadded<T>) {
             Some(ptr) => ptr,
             None => alloc::handle_alloc_error(layout),
         };
@@ -204,7 +200,7 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
             ptr,
             offset: CachePadded::new(AtomicUsize::new(0)),
             counter: CachePadded::new(AtomicUsize::new(0)),
-            flag: CachePadded::new(AtomicBool::new(false)),
+            flag: AtomicBool::new(false),
         }
     }
 
@@ -226,7 +222,7 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
 
                     unsafe {
                         let offset = ptr.add(current);
-                        ptr::write(offset, value);
+                        ptr::write(offset, CachePadded::new(value));
                     };
 
                     // This increment is necessary because this is what helps establish a happens

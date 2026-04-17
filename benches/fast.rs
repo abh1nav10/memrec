@@ -1,165 +1,177 @@
 use crossbeam::queue::ArrayQueue;
-use flume::bounded;
 use recmem::{FastSync, OpResult};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
-// Not a good way to benchmark as it ends up measuring the overhead of spawning threads as well.
-// TODO: Implement a better benchmark.
+struct Pool<const N: usize, M, O> {
+    /// Task senders and completion signal receivers for the threads pushing data into the queues.
+    senders: Box<[flume::Sender<M>]>,
+    receivers: Box<[flume::Receiver<()>]>,
+    /// Task sender and completion signal receiver for the drainer thread.
+    sender: flume::Sender<O>,
+    receiver: flume::Receiver<()>,
+    barrier: Arc<Barrier>,
+}
 
-fn fast_sync(num_threads: usize, enqueue: usize, num: usize) {
-    let fastsync = Arc::new(FastSync::<4, 16, usize>::new());
+impl<const N: usize, M, O> Pool<N, M, O>
+where
+    M: FnMut() + Send + 'static,
+    O: FnMut() + Send + 'static,
+{
+    fn spawn() -> Pool<N, M, O> {
+        let barrier = Arc::new(Barrier::new(N + 1));
+        let mut senders = Vec::with_capacity(N - 1);
+        let mut receivers = Vec::with_capacity(N - 1);
 
-    let mut handles = (0..(num_threads - 1))
-        .map(|_| {
-            let cloned = Arc::clone(&fastsync);
+        std::iter::repeat_with(|| {
+            let barrier = Arc::clone(&barrier);
+
+            let (tx_main, rx_main) = flume::bounded(N - 1);
+            let (tx, rx) = flume::bounded(N - 1);
+
             std::thread::spawn(move || {
-                let mut count = 1;
-                for i in 0..num {
-                    for j in 0..enqueue {
-                        if let OpResult::BackPressure(_) = cloned.push(i * j) {
-                            count += 1;
-                        }
+                // We only take the task through the channel once and then store it for the entire
+                // benchmark. That makes the impact of sending on the main task channel
+                // non-existent. Further, threads only send on the other channel when their work is
+                // done. This is compulsory to actually measure the time taken for a specific run of
+                // the benchmark.
+                let mut task: Option<M> = None;
+                loop {
+                    barrier.wait();
+                    // This branch is free because we will have the task in here only except the
+                    // first time. That must make the job of the branch predictor very very easy and
+                    // it will be accurate.
+                    if let Some(ref mut task) = task {
+                        task();
+                    } else {
+                        let t: M = rx_main.recv().unwrap();
+                        task = Some(t);
+                        task.as_mut().unwrap()();
                     }
+                    let _ = tx.send(());
                 }
-                println!("{count}");
-            })
+            });
+            (tx_main, rx)
         })
-        .collect::<Vec<_>>();
+        .take(N - 1)
+        .for_each(|(tx_main, rx)| {
+            senders.push(tx_main);
+            receivers.push(rx);
+        });
 
-    let flag = Arc::new(AtomicBool::new(false));
-    let cloned = Arc::clone(&flag);
-    let cloned_queue = Arc::clone(&fastsync);
+        // Support the sending of one drainer task.
+        let barrier_cloned = Arc::clone(&barrier);
 
-    handles.push(std::thread::spawn(move || {
-        let mut count = 0;
-        for i in 0..num {
-            for j in 0..enqueue {
-                if let OpResult::BackPressure(_) = cloned_queue.push(i * j) {
-                    count += 1;
+        let (tx_main, rx_main) = flume::unbounded();
+        let (tx, rx) = flume::unbounded();
+
+        std::thread::spawn(move || {
+            let mut task: Option<O> = None;
+            loop {
+                barrier_cloned.wait();
+                if let Some(ref mut task) = task {
+                    task();
+                } else {
+                    let t: O = rx_main.recv().unwrap();
+                    task = Some(t);
+                    task.as_mut().unwrap()();
                 }
+                let _ = tx.send(());
             }
-        }
-        println!("{count}");
-        cloned.store(true, Ordering::Relaxed);
-    }));
+        });
 
-    let mut count = 0;
-    while !flag.load(Ordering::Relaxed) {
-        fastsync.drain_with(|_| count += 1);
+        Pool {
+            senders: senders.into_boxed_slice(),
+            receivers: receivers.into_boxed_slice(),
+            sender: tx_main,
+            receiver: rx,
+            barrier,
+        }
     }
 
-    for handle in handles {
-        handle.join().unwrap();
+    fn send(&self, task: M, task2: O)
+    where
+        M: Clone,
+    {
+        self.senders.iter().take(N - 1).for_each(|s| {
+            let _ = s.send(task.clone());
+        });
+        let _ = self.sender.send(task2);
+    }
+
+    fn initiate(&self) {
+        self.barrier.wait();
+    }
+
+    fn finish(&self) {
+        self.receivers.iter().for_each(|r| {
+            let _ = r.recv();
+        });
+        let _ = self.receiver.recv();
     }
 }
 
-fn array_queue(num_threads: usize, enqueue: usize, num: usize) {
-    let queue = Arc::new(ArrayQueue::new(64));
-
-    let mut handles = (0..(num_threads - 1))
-        .map(|_| {
-            let cloned = Arc::clone(&queue);
-            std::thread::spawn(move || {
-                let mut count = 0;
-                for i in 0..num {
-                    for j in 0..enqueue {
-                        if cloned.push(i * j).is_err() {
-                            count += 1;
-                        }
-                    }
-                }
-                println!("{count}");
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let flag = Arc::new(AtomicBool::new(false));
-    let cloned = Arc::clone(&flag);
-    let cloned_queue = Arc::clone(&queue);
-
-    handles.push(std::thread::spawn(move || {
-        let mut count = 0;
-        for i in 0..num {
-            for j in 0..enqueue {
-                if cloned_queue.push(i * j).is_err() {
-                    count += 1;
-                }
-            }
-        }
-        println!("{count}");
-        cloned.store(true, Ordering::Relaxed);
-    }));
-
-    while !flag.load(Ordering::Relaxed) {
-        while queue.pop().is_some() {}
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
-}
-
-fn flume(num_threads: usize, enqueue: usize, num: usize) {
-    let (tx, rx) = bounded(64);
-    let tx = Arc::new(tx);
-
-    let mut handles = (0..(num_threads - 1))
-        .map(|_| {
-            let cloned = Arc::clone(&tx);
-            std::thread::spawn(move || {
-                let mut count = 0;
-                for i in 0..num {
-                    for j in 0..enqueue {
-                        if cloned.try_send(i * j).is_err() {
-                            count += 1;
-                        }
-                    }
-                }
-                println!("{count}");
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let flag = Arc::new(AtomicBool::new(false));
-    let cloned = Arc::clone(&flag);
-    let cloned_queue = Arc::clone(&tx);
-
-    handles.push(std::thread::spawn(move || {
-        let mut count = 0;
-        for i in 0..num {
-            for j in 0..enqueue {
-                if cloned_queue.send(i * j).is_err() {
-                    count += 1;
-                }
-            }
-        }
-        println!("{count}");
-        cloned.store(true, Ordering::Relaxed);
-    }));
-
-    while !flag.load(Ordering::Relaxed) {
-        while rx.try_recv().is_ok() {}
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
+// The function that Criterion runs repeatedly.
+fn measure<const N: usize, M, O>(pool: &Pool<N, M, O>)
+where
+    M: FnMut() + Send + 'static,
+    O: FnMut() + Send + 'static,
+{
+    pool.initiate();
+    pool.finish();
 }
 
 fn bench_queues(c: &mut Criterion) {
-    c.bench_function("Flume", |b| {
-        b.iter(|| flume(black_box(3), black_box(100000), black_box(3)))
-    });
-    c.bench_function("ArrayQueue", |b| {
-        b.iter(|| array_queue(black_box(3), black_box(100000), black_box(3)))
-    });
-    c.bench_function("FastSync", |b| {
-        b.iter(|| fast_sync(black_box(3), black_box(100000), black_box(3)))
-    });
+    // SETUP for benchmarking ArrayQueue
+    let arrayqueue = Arc::new(ArrayQueue::new(64));
+    let arrayqueue_cloned = Arc::clone(&arrayqueue);
+
+    let closure = move || {
+        //let mut count = 0;
+        for i in 0..1000 {
+            if arrayqueue.push(i).is_ok() {
+                //count += 1;
+            }
+        }
+        //println!("{count}");
+    };
+
+    let closure2 = move || {
+        for _ in 0..1000 {
+            while arrayqueue_cloned.pop().is_some() {}
+        }
+    };
+    let pool = Pool::<3, _, _>::spawn();
+    pool.send(black_box(closure), black_box(closure2));
+
+    c.bench_function("ArrayQueue", |b| b.iter(|| measure(black_box(&pool))));
+
+    // ----------------------------------------------------------------------------
+    // SETUP for benchmarking FastSync
+    let fastsync = Arc::new(FastSync::<8, 8, usize>::new());
+    let fastsync_cloned = Arc::clone(&fastsync);
+
+    let closure = move || {
+        //let mut count = 0;
+        for i in 0..1000 {
+            if let OpResult::Success = fastsync.push(i) {
+                //count += 1;
+            }
+        }
+        //println!("{count}");
+    };
+
+    let closure2 = move || {
+        for _ in 0..1000 {
+            fastsync_cloned.drain_with(|_| {});
+        }
+    };
+    let pool = Pool::<3, _, _>::spawn();
+    pool.send(black_box(closure), black_box(closure2));
+
+    c.bench_function("FastSync", |b| b.iter(|| measure(black_box(&pool))));
 }
 
 criterion_group!(benches, bench_queues);
