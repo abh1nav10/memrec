@@ -16,6 +16,30 @@ thread_local! {
 /// NUM_BATCH must be a power of two.
 pub struct FastSync<const NUM_BATCH: usize, const BATCH_SIZE: usize, T> {
     slot_ptrs: NonNull<Slot<BATCH_SIZE, T>>,
+
+    /// This field will only be accessed by the consumer thread that pops elements out. It has been
+    /// added to ensure better cache locality.
+    iteration: Cell<bool>,
+}
+
+impl<const N: usize, const B: usize, T> Drop for FastSync<N, B, T> {
+    fn drop(&mut self) {
+        let ptr = self.slot_ptrs.as_ptr();
+        for i in 0..N {
+            let slot = unsafe { &(*ptr.add(i)) };
+
+            let ptr = slot.ptr.as_ptr() as *mut u8;
+
+            let layout = Layout::array::<T>(B).expect("Batch size is less than isize::MAX");
+            unsafe { alloc::dealloc(ptr, layout) };
+        }
+
+        let ptr = ptr as *mut u8;
+        let layout =
+            Layout::array::<Slot<B, T>>(N).expect("Number of batches is less than isize::MAX");
+
+        unsafe { alloc::dealloc(ptr, layout) };
+    }
 }
 
 unsafe impl<const N: usize, const B: usize, T: Send> Send for FastSync<N, B, T> {}
@@ -57,7 +81,10 @@ where
             None => alloc::handle_alloc_error(layout),
         };
 
-        Self { slot_ptrs: ptr }
+        Self {
+            slot_ptrs: ptr,
+            iteration: Cell::new(false),
+        }
     }
 
     pub fn push(&self, value: T) -> OpResult<T> {
@@ -84,21 +111,49 @@ where
         // We have to pop the elements, and also reset the offset of the batches that we drain, back
         // to zero.
         let ptrs = self.slot_ptrs.as_ptr();
-        for i in 0..NUM_BATCH {
-            let slot = unsafe { &(*ptrs.add(i)) };
 
-            if slot.is_ready() {
-                // Acquire fence to ensure that we get to read what was written.
-                fence(Ordering::Acquire);
+        let current = self.iteration.get();
+        self.iteration.set(!current);
 
-                let ptr = slot.ptr.as_ptr();
+        // Since `Slot` is greater than the size of a cache line, and the executor checks all of
+        // them for readiness, by the time it reaches the last Slot, the initial slots that it
+        // checked might not be present in any of the caches. Checking in the reverse order of the
+        // previous iteration offers better temporal cache locality.
+        if current {
+            for i in 0..NUM_BATCH {
+                let slot = unsafe { &(*ptrs.add(i)) };
 
-                for j in 0..BATCH_SIZE {
-                    // T is Copy
-                    let value = unsafe { *(ptr.add(j)) };
-                    f(value);
+                if slot.is_ready() {
+                    // Acquire fence to ensure that we get to read what was written.
+                    fence(Ordering::Acquire);
+
+                    let ptr = slot.ptr.as_ptr();
+
+                    for j in 0..BATCH_SIZE {
+                        // T is Copy
+                        let value = unsafe { *(ptr.add(j)) };
+                        f(value);
+                    }
+                    slot.reset();
                 }
-                slot.reset();
+            }
+        } else {
+            for i in (0..NUM_BATCH).rev() {
+                let slot = unsafe { &(*ptrs.add(i)) };
+
+                if slot.is_ready() {
+                    // Acquire fence to ensure that we get to read what was written.
+                    fence(Ordering::Acquire);
+
+                    let ptr = slot.ptr.as_ptr();
+
+                    for j in 0..BATCH_SIZE {
+                        // T is Copy
+                        let value = unsafe { *(ptr.add(j)) };
+                        f(value);
+                    }
+                    slot.reset();
+                }
             }
         }
     }
@@ -284,7 +339,7 @@ mod tests {
 
     #[test]
     fn measure_arrayqueue() {
-        let queue = Arc::new(crossbeam_queue::ArrayQueue::new(64));
+        let queue = Arc::new(crossbeam::queue::ArrayQueue::new(64));
         let barrier = Arc::new(Barrier::new(6));
 
         let handles = (0..5)
