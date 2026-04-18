@@ -1,5 +1,7 @@
+#![allow(dead_code, unused_variables, unused_assignments)]
+
 use crossbeam::queue::ArrayQueue;
-use recmem::{FastSync, OpResult};
+use recmem::{OpResult, mpsc};
 use std::sync::{Arc, Barrier};
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -129,10 +131,10 @@ fn bench_queues(c: &mut Criterion) {
     let arrayqueue_cloned = Arc::clone(&arrayqueue);
 
     let closure = move || {
-        //let mut count = 0;
+        let mut count = 0;
         for i in 0..1000 {
             if arrayqueue.push(i).is_ok() {
-                //count += 1;
+                count += 1;
             }
         }
         //println!("{count}");
@@ -150,14 +152,14 @@ fn bench_queues(c: &mut Criterion) {
 
     // ----------------------------------------------------------------------------
     // SETUP for benchmarking FastSync
-    let fastsync = Arc::new(FastSync::<8, 8, usize>::new());
-    let fastsync_cloned = Arc::clone(&fastsync);
+    let (tx, rx) = mpsc::<8, 8, usize>();
+    let tx_cloned = tx.clone();
 
     let closure = move || {
-        //let mut count = 0;
+        let mut count = 0;
         for i in 0..1000 {
-            if let OpResult::Success = fastsync.push(i) {
-                //count += 1;
+            if let OpResult::Success = tx_cloned.push(i) {
+                count += 1;
             }
         }
         //println!("{count}");
@@ -165,7 +167,7 @@ fn bench_queues(c: &mut Criterion) {
 
     let closure2 = move || {
         for _ in 0..1000 {
-            fastsync_cloned.drain_with(|_| {});
+            rx.drain_with(|_| {});
         }
     };
     let pool = Pool::<3, _, _>::spawn();
@@ -174,5 +176,14 @@ fn bench_queues(c: &mut Criterion) {
     c.bench_function("FastSync", |b| b.iter(|| measure(black_box(&pool))));
 }
 
-criterion_group!(benches, bench_queues);
+// Bench the draining of queue when there are no pushers.
+fn bench_empty(c: &mut Criterion) {
+    let arrayqueue = Arc::new(ArrayQueue::<usize>::new(64));
+    c.bench_function("ArrayQueue", |b| b.iter(|| arrayqueue.pop()));
+
+    let (_, rx) = mpsc::<64, 1, usize>();
+    c.bench_function("FastSync", |b| b.iter(|| rx.drain_with(|_| {})));
+}
+
+criterion_group!(benches, bench_empty, bench_queues);
 criterion_main!(benches);

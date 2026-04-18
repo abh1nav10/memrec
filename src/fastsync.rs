@@ -5,24 +5,25 @@ use std::alloc::{self, Layout};
 use std::cell::Cell;
 use std::ptr;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 
 thread_local! {
     static COUNTER: Cell<usize> = const { Cell::new(0) };
 }
 
-/// A data structure with batch receiving.
+/// Stores a pointer to the allocation.
+/// Gets dropped when all the senders and the receiver is dropped.
 ///
 /// NUM_BATCH must be a power of two.
-pub struct FastSync<const NUM_BATCH: usize, const BATCH_SIZE: usize, T> {
+struct Data<const NUM_BATCH: usize, const BATCH_SIZE: usize, T> {
     slot_ptrs: NonNull<Slot<BATCH_SIZE, T>>,
-
-    /// This field will only be accessed by the consumer thread that pops elements out. It has been
-    /// added to ensure better cache locality.
-    iteration: Cell<bool>,
 }
 
-impl<const N: usize, const B: usize, T> Drop for FastSync<N, B, T> {
+unsafe impl<const N: usize, const B: usize, T: Send> Send for Data<N, B, T> {}
+unsafe impl<const N: usize, const B: usize, T: Send> Sync for Data<N, B, T> {}
+
+impl<const N: usize, const B: usize, T> Drop for Data<N, B, T> {
     fn drop(&mut self) {
         let ptr = self.slot_ptrs.as_ptr();
         for i in 0..N {
@@ -42,75 +43,35 @@ impl<const N: usize, const B: usize, T> Drop for FastSync<N, B, T> {
     }
 }
 
-unsafe impl<const N: usize, const B: usize, T: Send> Send for FastSync<N, B, T> {}
-unsafe impl<const N: usize, const B: usize, T: Send> Sync for FastSync<N, B, T> {}
+/// Sender is both `Send` and `Sync`. It is also cloneable.
+pub struct Sender<const N: usize, const B: usize, T> {
+    data: Arc<Data<N, B, T>>,
+}
 
-impl<const NUM_BATCH: usize, const BATCH_SIZE: usize, T> Default
-    for FastSync<NUM_BATCH, BATCH_SIZE, T>
-where
-    T: Copy,
-{
-    fn default() -> Self {
-        Self::new()
+impl<const N: usize, const B: usize, T> Clone for Sender<N, B, T> {
+    fn clone(&self) -> Self {
+        Self {
+            data: Arc::clone(&self.data),
+        }
     }
 }
 
-impl<const NUM_BATCH: usize, const BATCH_SIZE: usize, T> FastSync<NUM_BATCH, BATCH_SIZE, T>
+/// Receiver is `Send` but not `Sync`. It also does not implement the `Clone` trait.
+pub struct Receiver<const N: usize, const B: usize, T> {
+    data: Arc<Data<N, B, T>>,
+    /// This field will only be accessed by the consumer thread that pops elements out. It has been
+    /// added to ensure better cache locality.
+    iteration: Cell<bool>,
+}
+
+impl<const N: usize, const B: usize, T> Receiver<N, B, T>
 where
     T: Copy,
 {
-    pub fn new() -> Self {
-        assert!(NUM_BATCH < isize::MAX as usize);
-
-        let layout = Layout::array::<Slot<BATCH_SIZE, T>>(NUM_BATCH)
-            .expect("NUM_BATCH is less than isize::MAX");
-        let ptr = unsafe { alloc::alloc(layout) };
-
-        let ptr = ptr as *mut Slot<BATCH_SIZE, T>;
-
-        for i in 0..NUM_BATCH {
-            let slot = Slot::<BATCH_SIZE, T>::new();
-            unsafe {
-                let offset = ptr.add(i);
-                offset.write(slot);
-            }
-        }
-
-        let ptr = match NonNull::new(ptr) {
-            Some(ptr) => ptr,
-            None => alloc::handle_alloc_error(layout),
-        };
-
-        Self {
-            slot_ptrs: ptr,
-            iteration: Cell::new(false),
-        }
-    }
-
-    pub fn push(&self, value: T) -> OpResult<T> {
-        let ptrs = self.slot_ptrs.as_ptr();
-        let current = COUNTER.get();
-
-        let mask = NUM_BATCH - 1;
-        let mut new = (current + 1) & mask;
-        COUNTER.set((new + 3) & mask);
-
-        while new != current {
-            let slot = unsafe { &(*ptrs.add(new)) };
-
-            match slot.push(value) {
-                OpResult::Success => return OpResult::Success,
-                OpResult::BackPressure(_) => {}
-            }
-            new = (new + 1) & mask;
-        }
-        OpResult::BackPressure(value)
-    }
-
-    pub fn drain_with(&self, mut f: impl FnMut(CachePadded<T>)) {
+    pub fn drain_with(&self, mut f: impl FnMut(T)) {
         // We have to pop the elements, and also reset the offset of the batches that we drain, back
         // to zero.
-        let ptrs = self.slot_ptrs.as_ptr();
+        let ptrs = self.data.slot_ptrs.as_ptr();
 
         let current = self.iteration.get();
         self.iteration.set(!current);
@@ -120,7 +81,7 @@ where
         // checked might not be present in any of the caches. Checking in the reverse order of the
         // previous iteration offers better temporal cache locality.
         if current {
-            for i in 0..NUM_BATCH {
+            for i in 0..N {
                 let slot = unsafe { &(*ptrs.add(i)) };
 
                 if slot.is_ready() {
@@ -129,7 +90,7 @@ where
 
                     let ptr = slot.ptr.as_ptr();
 
-                    for j in 0..BATCH_SIZE {
+                    for j in 0..B {
                         // T is Copy
                         let value = unsafe { *(ptr.add(j)) };
                         f(value);
@@ -138,7 +99,7 @@ where
                 }
             }
         } else {
-            for i in (0..NUM_BATCH).rev() {
+            for i in (0..N).rev() {
                 let slot = unsafe { &(*ptrs.add(i)) };
 
                 if slot.is_ready() {
@@ -147,7 +108,7 @@ where
 
                     let ptr = slot.ptr.as_ptr();
 
-                    for j in 0..BATCH_SIZE {
+                    for j in 0..B {
                         // T is Copy
                         let value = unsafe { *(ptr.add(j)) };
                         f(value);
@@ -159,10 +120,74 @@ where
     }
 }
 
+impl<const NUM_BATCH: usize, const BATCH_SIZE: usize, T> Sender<NUM_BATCH, BATCH_SIZE, T> {
+    pub fn push(&self, mut value: T) -> OpResult<T> {
+        let ptrs = self.data.slot_ptrs.as_ptr();
+        let current = COUNTER.get();
+
+        let mask = NUM_BATCH - 1;
+        let mut new = (current + 1) & mask;
+        COUNTER.set((new + 1) & mask);
+
+        while new != current {
+            let slot = unsafe { &(*ptrs.add(new)) };
+
+            match slot.push(value) {
+                OpResult::Success => return OpResult::Success,
+                OpResult::BackPressure(v) => {
+                    value = v;
+                }
+            }
+            new = (new + 1) & mask;
+        }
+        OpResult::BackPressure(value)
+    }
+}
+
+pub fn mpsc<const NUM_BATCH: usize, const BATCH_SIZE: usize, T>() -> (
+    Sender<NUM_BATCH, BATCH_SIZE, T>,
+    Receiver<NUM_BATCH, BATCH_SIZE, T>,
+) {
+    assert!(NUM_BATCH < isize::MAX as usize);
+    assert!(NUM_BATCH.is_power_of_two());
+
+    let layout =
+        Layout::array::<Slot<BATCH_SIZE, T>>(NUM_BATCH).expect("NUM_BATCH is less than isize::MAX");
+    let ptr = unsafe { alloc::alloc(layout) };
+
+    let ptr = ptr as *mut Slot<BATCH_SIZE, T>;
+
+    for i in 0..NUM_BATCH {
+        let slot = Slot::<BATCH_SIZE, T>::new();
+        unsafe {
+            let offset = ptr.add(i);
+            offset.write(slot);
+        }
+    }
+
+    let ptr = match NonNull::new(ptr) {
+        Some(ptr) => ptr,
+        None => alloc::handle_alloc_error(layout),
+    };
+
+    let data = Arc::new(Data { slot_ptrs: ptr });
+    let sender = Sender {
+        data: Arc::clone(&data),
+    };
+
+    let receiver = Receiver {
+        data,
+        iteration: Cell::new(false),
+    };
+    (sender, receiver)
+}
+
 /// `SIZE` referes to the size of the allocation.
 struct Slot<const SIZE: usize, T> {
     /// Pointer to the start of the allocation.
-    ptr: NonNull<CachePadded<T>>,
+    /// Not cachepadding this to reduce the amount of time taken by the executor to go through the
+    /// elements when the slot is full as more elements can be on a cacheline.
+    ptr: NonNull<T>,
 
     /// The current offset into the allocation.
     offset: CachePadded<AtomicUsize>,
@@ -188,10 +213,10 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
         assert!(size_of::<T>() > 0, "Zero sized types are not supported!");
         assert!(SIZE < isize::MAX as usize);
 
-        let layout = Layout::array::<CachePadded<T>>(SIZE).expect("Size if less than `isize::MAX`");
+        let layout = Layout::array::<T>(SIZE).expect("Size if less than `isize::MAX`");
         let ptr = unsafe { alloc::alloc(layout) };
 
-        let ptr = match NonNull::new(ptr as *mut CachePadded<T>) {
+        let ptr = match NonNull::new(ptr as *mut T) {
             Some(ptr) => ptr,
             None => alloc::handle_alloc_error(layout),
         };
@@ -222,7 +247,7 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
 
                     unsafe {
                         let offset = ptr.add(current);
-                        ptr::write(offset, CachePadded::new(value));
+                        ptr::write(offset, value);
                     };
 
                     // This increment is necessary because this is what helps establish a happens
@@ -265,43 +290,17 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    #[test]
-    fn multi() {
-        let fastsync = Arc::new(FastSync::<5, 5, _>::new());
-
-        let handles = (0..5)
-            .map(|_| {
-                let cloned = Arc::clone(&fastsync);
-                std::thread::spawn(move || {
-                    for i in 0..4 {
-                        cloned.push(i);
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-
-        for _ in 0..4 {
-            fastsync.drain_with(|n| println!("{n}"));
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-    }
-
-    use std::sync::Barrier;
+    use super::mpsc;
+    use std::sync::{Arc, Barrier};
     use std::time::Instant;
     #[test]
     fn measure_fastsync() {
-        let fastsync = Arc::new(FastSync::<32, 2, _>::new());
+        let (tx, rx) = mpsc::<32, 2, _>();
         let barrier = Arc::new(Barrier::new(6));
 
         let handles = (0..5)
             .map(|_| {
-                let cloned = Arc::clone(&fastsync);
+                let cloned = tx.clone();
                 let barrier = Arc::clone(&barrier);
 
                 std::thread::spawn(move || {
@@ -320,7 +319,7 @@ mod tests {
 
         let mut count = 0;
         for _ in 0..8 {
-            fastsync.drain_with(|_| count += 1);
+            rx.drain_with(|_| count += 1);
         }
 
         let elapsed = time.elapsed().as_micros();

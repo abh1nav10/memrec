@@ -6,7 +6,7 @@ mod loom;
 pub mod msqueue;
 
 pub use backoff::Backoff;
-pub use fastsync::{FastSync, OpResult};
+pub use fastsync::{OpResult, mpsc};
 pub use hazard::markers;
 pub use hazard::{GLOBAL_REGISTRY, Holder, Provide, Provider, Registry};
 pub use msqueue::Queue;
