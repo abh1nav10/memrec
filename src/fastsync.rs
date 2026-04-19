@@ -3,10 +3,13 @@
 use crossbeam_utils::CachePadded;
 use std::alloc::{self, Layout};
 use std::cell::Cell;
-use std::ptr;
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering, fence};
+
+const EMPTY: u8 = 0;
+const FULL: u8 = 1;
 
 thread_local! {
     static COUNTER: Cell<usize> = const { Cell::new(0) };
@@ -16,7 +19,19 @@ thread_local! {
 /// Gets dropped when all the senders and the receiver is dropped.
 ///
 /// NUM_BATCH must be a power of two.
+#[repr(C)]
 struct Data<const NUM_BATCH: usize, const BATCH_SIZE: usize, T> {
+    /// Since these flags are not CachePadded, in a highly contentious scenario, all cores will be
+    /// hammering the same cacheline and performance will degrade very heavily. However, in case of
+    /// COMPIO, since we are optimizing for the case where the queue is mostly empty as cross-thread
+    /// wakeups are rare, this will make it pretty easy for the executor to check which slots are
+    /// ready, as all flags can be loaded on the same cache line and the check can happen with a
+    /// `Relaxed` load. Also, since the executor checks the queue in every iteration, the flag will
+    /// stay hot in one of the caches which will make it even faster. Also, the executor only checks
+    /// the flag instead of checking the offset field of Slot which reduces the snatching away of
+    /// the cacheline by the executor from the Exclusive state to Shared state when the threads are about
+    /// to write to it.
+    flags: [AtomicU8; NUM_BATCH],
     slot_ptrs: NonNull<Slot<BATCH_SIZE, T>>,
 }
 
@@ -26,14 +41,21 @@ unsafe impl<const N: usize, const B: usize, T: Send> Sync for Data<N, B, T> {}
 impl<const N: usize, const B: usize, T> Drop for Data<N, B, T> {
     fn drop(&mut self) {
         let ptr = self.slot_ptrs.as_ptr();
-        for i in 0..N {
+        (0..N).for_each(|i| {
             let slot = unsafe { &(*ptr.add(i)) };
 
-            let ptr = slot.ptr.as_ptr() as *mut u8;
+            let ptr = slot.ptr.as_ptr();
+            let num_occupied = slot.counter.load(Ordering::Acquire);
+            (0..num_occupied).for_each(|i| unsafe {
+                let offset = ptr.add(i);
+                (*offset).assume_init_drop();
+            });
 
-            let layout = Layout::array::<T>(B).expect("Batch size is less than isize::MAX");
+            let ptr = ptr as *mut u8;
+            let layout =
+                Layout::array::<MaybeUninit<T>>(B).expect("Batch size is less than isize::MAX");
             unsafe { alloc::dealloc(ptr, layout) };
-        }
+        });
 
         let ptr = ptr as *mut u8;
         let layout =
@@ -64,10 +86,7 @@ pub struct Receiver<const N: usize, const B: usize, T> {
     iteration: Cell<bool>,
 }
 
-impl<const N: usize, const B: usize, T> Receiver<N, B, T>
-where
-    T: Copy,
-{
+impl<const N: usize, const B: usize, T> Receiver<N, B, T> {
     pub fn drain_with(&self, mut f: impl FnMut(T)) {
         // We have to pop the elements, and also reset the offset of the batches that we drain, back
         // to zero.
@@ -81,41 +100,47 @@ where
         // checked might not be present in any of the caches. Checking in the reverse order of the
         // previous iteration offers better temporal cache locality.
         if current {
-            for i in 0..N {
-                let slot = unsafe { &(*ptrs.add(i)) };
-
-                if slot.is_ready() {
-                    // Acquire fence to ensure that we get to read what was written.
+            self.data.flags.iter().enumerate().for_each(|(i, flag)| {
+                if flag.load(Ordering::Relaxed) == FULL {
                     fence(Ordering::Acquire);
 
+                    let slot = unsafe { &(*ptrs.add(i)) };
                     let ptr = slot.ptr.as_ptr();
 
-                    for j in 0..B {
-                        // T is Copy
-                        let value = unsafe { *(ptr.add(j)) };
+                    (0..B).for_each(|j| {
+                        let value = unsafe { (*ptr.add(j)).assume_init_read() };
                         f(value);
-                    }
+                    });
+
+                    self.data.flags[i].store(EMPTY, Ordering::Relaxed);
+                    // Resetting sets the offset back to 0 with a Release Ordering in order to
+                    // ensure that the operations prior to the resetting are not reordered to
+                    // happen after it.
                     slot.reset();
                 }
-            }
+            });
         } else {
-            for i in (0..N).rev() {
-                let slot = unsafe { &(*ptrs.add(i)) };
+            self.data
+                .flags
+                .iter()
+                .enumerate()
+                .rev()
+                .for_each(|(i, flag)| {
+                    if flag.load(Ordering::Relaxed) == FULL {
+                        fence(Ordering::Acquire);
 
-                if slot.is_ready() {
-                    // Acquire fence to ensure that we get to read what was written.
-                    fence(Ordering::Acquire);
+                        let slot = unsafe { &(*ptrs.add(i)) };
+                        let ptr = slot.ptr.as_ptr();
 
-                    let ptr = slot.ptr.as_ptr();
+                        (0..B).for_each(|j| {
+                            let value = unsafe { (*ptr.add(j)).assume_init_read() };
+                            f(value);
+                        });
 
-                    for j in 0..B {
-                        // T is Copy
-                        let value = unsafe { *(ptr.add(j)) };
-                        f(value);
+                        self.data.flags[i].store(EMPTY, Ordering::Relaxed);
+                        slot.reset();
                     }
-                    slot.reset();
-                }
-            }
+                });
         }
     }
 }
@@ -137,6 +162,10 @@ impl<const NUM_BATCH: usize, const BATCH_SIZE: usize, T> Sender<NUM_BATCH, BATCH
                 OpResult::BackPressure(v) => {
                     value = v;
                 }
+                OpResult::Completed => {
+                    self.data.flags[new].store(FULL, Ordering::Release);
+                    return OpResult::Success;
+                }
             }
             new = (new + 1) & mask;
         }
@@ -157,20 +186,26 @@ pub fn mpsc<const NUM_BATCH: usize, const BATCH_SIZE: usize, T>() -> (
 
     let ptr = ptr as *mut Slot<BATCH_SIZE, T>;
 
-    for i in 0..NUM_BATCH {
+    (0..NUM_BATCH).for_each(|i| {
         let slot = Slot::<BATCH_SIZE, T>::new();
         unsafe {
             let offset = ptr.add(i);
             offset.write(slot);
         }
-    }
+    });
 
     let ptr = match NonNull::new(ptr) {
         Some(ptr) => ptr,
         None => alloc::handle_alloc_error(layout),
     };
 
-    let data = Arc::new(Data { slot_ptrs: ptr });
+    let flags: [AtomicU8; NUM_BATCH] = std::array::from_fn(|_| AtomicU8::new(EMPTY));
+
+    let data = Arc::new(Data {
+        slot_ptrs: ptr,
+        flags,
+    });
+
     let sender = Sender {
         data: Arc::clone(&data),
     };
@@ -187,7 +222,7 @@ struct Slot<const SIZE: usize, T> {
     /// Pointer to the start of the allocation.
     /// Not cachepadding this to reduce the amount of time taken by the executor to go through the
     /// elements when the slot is full as more elements can be on a cacheline.
-    ptr: NonNull<T>,
+    ptr: NonNull<MaybeUninit<T>>,
 
     /// The current offset into the allocation.
     offset: CachePadded<AtomicUsize>,
@@ -195,17 +230,13 @@ struct Slot<const SIZE: usize, T> {
     /// The threads update this flag with an AcqRel ordering in order to ensure that we establish a
     /// transitive happens before relationship with all prior writes.
     counter: CachePadded<AtomicUsize>,
-
-    /// Flag to signal that the batch is ready to be recieved. We use this flag in order to avoid
-    /// any form of contention on the offset by the executor if the corresponding flag is not ready
-    /// to be received.
-    flag: AtomicBool,
 }
 
 #[derive(Debug)]
 pub enum OpResult<T> {
     Success,
     BackPressure(T),
+    Completed,
 }
 
 impl<const SIZE: usize, T> Slot<SIZE, T> {
@@ -213,10 +244,10 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
         assert!(size_of::<T>() > 0, "Zero sized types are not supported!");
         assert!(SIZE < isize::MAX as usize);
 
-        let layout = Layout::array::<T>(SIZE).expect("Size if less than `isize::MAX`");
+        let layout = Layout::array::<MaybeUninit<T>>(SIZE).expect("Size if less than `isize::MAX`");
         let ptr = unsafe { alloc::alloc(layout) };
 
-        let ptr = match NonNull::new(ptr as *mut T) {
+        let ptr = match NonNull::new(ptr as *mut MaybeUninit<T>) {
             Some(ptr) => ptr,
             None => alloc::handle_alloc_error(layout),
         };
@@ -225,7 +256,6 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
             ptr,
             offset: CachePadded::new(AtomicUsize::new(0)),
             counter: CachePadded::new(AtomicUsize::new(0)),
-            flag: AtomicBool::new(false),
         }
     }
 
@@ -247,7 +277,7 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
 
                     unsafe {
                         let offset = ptr.add(current);
-                        ptr::write(offset, value);
+                        (*offset).write(value);
                     };
 
                     // This increment is necessary because this is what helps establish a happens
@@ -261,7 +291,7 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
                         // fetch_add previously cannot be reordered to happen after this store
                         // because of the Release Ordering, the executor are guaranteed to see all prior
                         // writes.
-                        self.flag.store(true, Ordering::Release);
+                        break OpResult::Completed;
                     }
                     break OpResult::Success;
                 }
@@ -276,12 +306,8 @@ impl<const SIZE: usize, T> Slot<SIZE, T> {
         }
     }
 
-    fn is_ready(&self) -> bool {
-        self.flag.load(Ordering::Relaxed)
-    }
-
     fn reset(&self) {
-        self.flag.store(false, Ordering::Relaxed);
+        self.counter.store(0, Ordering::Relaxed);
         // Ordering::Release because we have to ensure that none of the draining is reordered to
         // happen after the store to the index.
         self.offset.store(0, Ordering::Release);
@@ -293,6 +319,8 @@ mod tests {
     use super::mpsc;
     use std::sync::{Arc, Barrier};
     use std::time::Instant;
+
+    // Criterion benchmarks in the benches directory.
     #[test]
     fn measure_fastsync() {
         let (tx, rx) = mpsc::<32, 2, _>();

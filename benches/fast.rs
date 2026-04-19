@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_variables, unused_assignments)]
+#![allow(dead_code, unused_variables, unused_assignments, unused_imports)]
 
 use crossbeam::queue::ArrayQueue;
 use recmem::{OpResult, mpsc};
@@ -181,7 +181,7 @@ fn bench_empty(c: &mut Criterion) {
     let arrayqueue = Arc::new(ArrayQueue::<usize>::new(64));
     c.bench_function("ArrayQueue", |b| b.iter(|| arrayqueue.pop()));
 
-    let (_, rx) = mpsc::<64, 1, usize>();
+    let (_, rx) = mpsc::<16, 1, usize>();
     c.bench_function("FastSync", |b| b.iter(|| rx.drain_with(|_| {})));
 }
 
