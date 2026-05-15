@@ -17,6 +17,7 @@ thread_local! {
 
 /// Stores a pointer to the allocation.
 /// Gets dropped when all the senders and the receiver is dropped.
+#[derive(Debug)]
 #[repr(C)]
 struct Data<T> {
     flag: AtomicU64,
@@ -53,6 +54,7 @@ impl<T> Drop for Data<T> {
 }
 
 /// Sender is both `Send` and `Sync`. It is also cloneable.
+#[derive(Debug)]
 pub struct Sender<T> {
     data: Arc<Data<T>>,
 }
@@ -66,52 +68,34 @@ impl<T> Clone for Sender<T> {
 }
 
 /// Receiver is `Send` but not `Sync`. It also does not implement the `Clone` trait.
+#[derive(Debug)]
 pub struct Receiver<T> {
     data: Arc<Data<T>>,
-    /// This field will only be accessed by the consumer thread that pops elements out. It has been
-    /// added to ensure better cache locality.
-    iteration: Cell<bool>,
 }
 
 impl<T> Receiver<T> {
-    pub fn drain_with(&self, f: impl FnMut(T)) {
+    pub fn drain_with(&self, mut f: impl FnMut(T)) {
         // We have to pop the elements, and also reset the offset of the batches that we drain, back
         // to zero.
-        let current = self.iteration.get();
-        self.iteration.set(!current);
-
-        let val = self.data.flag.load(Ordering::Relaxed);
+        let mut val = self.data.flag.load(Ordering::Relaxed);
         if val != 0 {
             // Acquire the writes to the slots that we just observed to be full.
             fence(Ordering::Acquire);
-            // Since `Slot` is greater than the size of a cache line, and the executor checks all of
-            // them for readiness, by the time it reaches the last Slot, the initial slots that it
-            // checked might not be present in any of the caches. Checking in the reverse order of the
-            // previous iteration offers better temporal cache locality.
-            if current {
-                self.iterate(0..self.data.size, val, f);
-            } else {
-                self.iterate((0..self.data.size).rev(), val, f);
-            }
-        }
-    }
 
-    fn iterate(&self, iter: impl Iterator<Item = u8>, val: u64, mut f: impl FnMut(T)) {
-        let ptrs = self.data.slot_ptr.as_ptr();
-
-        iter.for_each(|i| {
-            if val & (1 << i) != 0 {
-                let slot = unsafe { &(*ptrs.add(i as usize)) };
+            let ptrs = self.data.slot_ptr.as_ptr();
+            while val != 0 {
+                let index = val.trailing_zeros();
+                let slot = unsafe { &(*ptrs.add(index as usize)) };
                 let ptr = slot.ptr.as_ptr();
-
                 (0..slot.size).for_each(|j| {
                     let value = unsafe { (*ptr.add(j)).assume_init_read() };
                     f(value);
                 });
-                self.data.flag.fetch_and(!(1 << i), Ordering::Relaxed);
+                self.data.flag.fetch_and(!(1 << index), Ordering::Relaxed);
                 slot.reset();
+                val &= !(1 << index);
             }
-        });
+        }
     }
 }
 
@@ -187,10 +171,7 @@ pub fn mpsc<T>(size: usize) -> (Sender<T>, Receiver<T>) {
     let sender = Sender {
         data: Arc::clone(&data),
     };
-    let receiver = Receiver {
-        data,
-        iteration: Cell::new(false),
-    };
+    let receiver = Receiver { data };
     (sender, receiver)
 }
 
@@ -210,7 +191,7 @@ struct Slot<T> {
     size: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum OpResult<T> {
     Success,
     BackPressure(T),
@@ -283,5 +264,29 @@ impl<T> Slot<T> {
         // Ordering::Release because we have to ensure that none of the draining is reordered to
         // happen after the store to the index.
         self.offset.store(0, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check() {
+        let (tx, rx) = mpsc(64);
+
+        (0..64).for_each(|i| {
+            let res = tx.push(i);
+            assert_eq!(res, OpResult::Success);
+        });
+
+        let res = tx.push(42);
+        assert_eq!(res, OpResult::BackPressure(42));
+
+        let mut count = 0;
+        rx.drain_with(|_| {
+            count += 1;
+        });
+        assert_eq!(count, 64);
     }
 }
