@@ -152,7 +152,7 @@ fn bench_queues(c: &mut Criterion) {
 
     // ----------------------------------------------------------------------------
     // SETUP for benchmarking FastSync
-    let (tx, rx) = mpsc::<8, 8, usize>();
+    let (tx, rx) = mpsc::<usize>(64);
     let tx_cloned = tx.clone();
 
     let closure = move || {
@@ -179,10 +179,18 @@ fn bench_queues(c: &mut Criterion) {
 // Bench the draining of queue when there are no pushers.
 fn bench_empty(c: &mut Criterion) {
     let arrayqueue = Arc::new(ArrayQueue::<usize>::new(64));
-    c.bench_function("ArrayQueue", |b| b.iter(|| arrayqueue.pop()));
+    c.bench_function("ArrayQueue", |b| b.iter(|| black_box(arrayqueue.pop())));
 
-    let (_, rx) = mpsc::<16, 1, usize>();
-    c.bench_function("FastSync", |b| b.iter(|| rx.drain_with(|_| {})));
+    let (_, rx) = mpsc::<usize>(64);
+
+    fn foo(rx: &recmem::fastsync::Receiver<usize>) -> u8 {
+        let mut count = 0;
+        rx.drain_with(|_| {
+            count += 1;
+        });
+        count
+    }
+    c.bench_function("FastSync", |b| b.iter(|| black_box(foo(black_box(&rx)))));
 }
 
 criterion_group!(benches, bench_empty, bench_queues);
